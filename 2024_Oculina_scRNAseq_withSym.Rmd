@@ -1,0 +1,4097 @@
+---
+title: "2024_Oculina_scRNAseq_withSym"
+output: html_document
+date: "2024-01-15"
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+setwd("/projectnb/coral/MVI_Oculina/10X_22_ApV2/outs/fastq_path")
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+install.packages("stringr")
+install.packages("Seurat")
+install.packages("openxlsx")
+install.packages("deldir")
+install.packages("tidyverse")
+install.packages("dplyr")
+BiocManager::install("MAST")
+install.packages("sctransform")
+install.packages("microseq")
+install.packages("RColorBrewer")
+install.packages("ggplot2")
+BiocManager::install("glmGamPoi")
+install.packages("superheat")
+install.packages("purrr")
+install.packages("tibble")
+BiocManager::install("DESeq2")
+install.packages("ggrepel")
+#install.packages("devtools") 
+#install.packages("xfun")
+install.packages("cowplot")
+
+#devtools::install_github("loukesio/ggvolc")
+
+library(stringr)
+library(deldir)
+library(Seurat)
+library(tidyverse)
+library(openxlsx)
+library(MAST)
+library(dplyr)
+library(microseq)
+library(sctransform)
+library(RColorBrewer)
+library(ggplot2)
+library(glmGamPoi)
+library(gplots)
+library(ggplot2)
+library(pheatmap)
+library(superheat)
+library(purrr)
+library(tibble)
+library(DESeq2)
+library(ggrepel)
+library(cowplot)
+library(devtools)
+```
+
+## Alignment and quantification
+
+First get your fastq files from the BU Single Cell Sequencing Data core, they'll transfer it to you on the SFTP server
+
+Next, unzip those files, and you can run fastqc on them (I ran fastqc in the original 10X_22 directory in /AAAT5WFHV/); run fastqc as a qsub .sh file
+```{r}
+tar tar xvf 2022-08-01_DaviesS_fastqs.tgz
+
+#fastqc.sh:
+
+#!/bin/bash -l
+
+#$-P coral
+#$-j y
+#$-N AAAT5WFHV
+#$-l h_rt=12:00:00
+#$-pe omp 16
+
+module load fastqc
+
+fastqc -t 8 -f fastq -o ./fastqc_output/ /projectnb/coral/MVI_Oculina/10X_22/outs/fastq_path/AAAT5WFHV/*.gz
+```
+
+Alignment and quantification of single cell data is done using cellranger count from the 10X genomics cellranger software package. 
+
+Cellranger count performs alignment, filtering, barcode counting, and UMI counting. It uses the Chromium cellular barcodes to generate feature-barcode matrices, determine clusters, and perform gene expression analysis. 
+
+Expanding on the general overview, demultiplexed fastqs are aligned to the genome using STAR. Reads aligning to the transcriptome are grouped by barcode, UMI, and associated gene. If the same barcode and UMI are associated with mulitple genes, the more supported gene group is kept and the other is discarded. After filtering, each barcode-UMI-gene is recorded as a single UMI count in the barcode-feature matrix. Next, cellranger calls cells based on the EmptyDrops method from Lun et al., 2018. This first calls high UMI content barcodes as cells. Secondly, it constructs a background model of the lowliest UMI-containing barcodes (empty droplets) and compares the profile of the remaining uncalled barcodes to the model. Barcodes poorly fittiing the background model are called as cells.
+
+More information on cellranger can be found here: https://support.10xgenomics.com/single-cell-gene-expression/software/overview/welcome
+
+More information on the underlying cellranger algorithms can be found here: https://support.10xgenomics.com/single-cell-gene-expression/software/pipelines/latest/algorithms/overview
+
+Making a gtf from the Apoculata gff3
+```{r}
+module load cufflinks
+gffread apoculata_v2.0.gff3 -T -o apoculata_v2.0.gtf
+
+```
+
+Filter your file to contain only those annotated as exons (i.e., exclude gene, CDS, and mRNA in our case)
+--> this isn't necessary for the mkref step but, according to 10X, "To be considered for transcriptome alignment, genes must have annotations with feature type 'exon' (column 3) in the GTF file." 
+https://support.10xgenomics.com/single-cell-gene-expression/software/pipelines/latest/advanced/references#mkgtf 
+
+```{r}
+module load cellranger
+cellranger mkgtf apoculata_v2.0.gtf apoculata_exons_v2.0.filtered.gtf --attribute=gene_biotype:protein_coding
+```
+This filtering didn't seem to do anything
+The length of both files (wc -l) = 476705
+
+
+Trying to use cellranger to map the oculina reads to the sym "genome" to see if I can locate my sym hosting cells
+
+Made a dummy genome for B. psygmophilum using Dan's transcriptome on his github https://github.com/wuitchik/MPCC_2018/blob/main/Host_analyses/Mapping/Astrangia/Astrangia_mapping.sh
+
+he only made a gff3 so I have to convert that to a fake gtf
+
+```{r}
+module load bcl2fastq/2.20
+module load cellranger/7.2.0
+
+awk '{ gsub(/ID=/,"", $9); print } ' algae_ref.gff > algae_ref.gtf #delete the ID= from column 9
+awk 'BEGIN{ OFS=FS } {$9="\""$9"\""; print } ' algae_ref.gtf > algae_ref1.gtf #put quotes around the string in column 9
+awk 'BEGIN{ OFS="\t" } { gsub(/gene/,"exon", $3); print } ' algae_ref1.gtf > algae_ref2.gtf #replace "gene" with "exon" in column 3
+awk 'BEGIN{ OFS="\t" }$9="transcript_id "$9 "; gene_id "$9' algae_ref3.gtf > algae_ref4.gtf #repeat string in column 9 with one repition started by "transcript_id" and one by "gene_id" with a semi-colon separating them
+awk 'BEGIN{ FS=OFS="\t" } { gsub(/./,".", $6); gsub(/./,"+", $7); gsub(/./,"0", $8); print } ' algae_ref4.gtf > algae_ref5.gtf #put these different symbols in columns 6, 7, and 8, as recommended here: http://mblab.wustl.edu/GTF22.html
+#also the {FS=OFS="\t"} is the proper way to ensure that the file is tab separated and nothing gets all funky
+cellranger mkgtf algae_ref5.gtf algae_ref5_filt.gtf --attribute=gene_biotype:protein_coding
+qsub mkref_algae.sh 
+
+#the mkref_algae.sh is as follows:
+#!/bin/bash -l
+
+#$-P coral
+#$-j y
+#$-N fastq_path
+#$-l h_rt=12:00:00
+#$-pe omp 16
+
+module load bcl2fastq/2.20
+module load cellranger/7.2.0
+
+cellranger mkref --genome=algae_refgenome --fasta=algae_reftranscriptome.fasta --genes=algae_ref5_filt.gtf
+
+```
+
+```{r}
+#as a count_algae.sh file (count_algae_sampleID.sh for each of the samples)
+
+#A3
+
+#!/bin/bash -l
+
+#$-P coral
+#$-j y
+#$-N fastq_path
+#$-l h_rt=12:00:00
+#$-pe omp 16
+
+module load bcl2fastq/2.20
+module load cellranger/7.2.0
+
+cellranger count \
+--id='A3_algae' \
+--description='Oculina A3' \
+--include-introns \
+--sample='IM_DS_0616_A3' \
+--localcores=24 \
+--fastqs=/projectnb/coral/MVI_Oculina/10X_22_ApV2/outs/fastq_path/AAAT5WFHV/ \
+--transcriptome=/projectnb/coral/MVI_Oculina/10X_22_ApV2/outs/fastq_path/algae_refgenome
+
+#Set 2 S3 (nubbin 2F1)
+cellranger count \
+--id='S3_algae' \
+--description='Oculina S3' \
+--include-introns \
+--sample='IM_DS_0616_S3' \
+--localcores=24 \
+--fastqs=/projectnb/coral/MVI_Oculina/10X_22_ApV2/outs/fastq_path/AAAT5WFHV/ \
+--transcriptome=/projectnb/coral/MVI_Oculina/10X_22_ApV2/outs/fastq_path/algae_refgenome
+```
+
+The outputs look really bad, so that's not the way to go
+
+I should probably concatenate the genomes of the host and sym and then rerun cellranger mkref once for concatenated-genome + host-only-genes and then another time for concatenated-genome + sym-only-genes
+
+Then do cellranger count again for apo and sym with both of those conditions
+
+This will allow me to get the IDs of the cells with symbiont reads that I can then mark in the dataset with host-only reads
+```{r}
+cat apoculata.assembly.scaffolds_chromosome_level.fasta algae_reftranscriptome.fasta > holobiont_genome.fasta
+
+#the mkref_host_cat.sh is as follows:
+#!/bin/bash -l
+
+#$-P coral
+#$-j y
+#$-N fastq_path
+#$-l h_rt=12:00:00
+#$-pe omp 16
+
+module load bcl2fastq/2.20
+module load cellranger/7.2.0
+
+cellranger mkref --genome=host_cat_refgenome --fasta=holobiont_genome.fasta --genes=apoculata_v2.0.gtf
+
+#the mkref_sym_cat.sh is as follows:
+#!/bin/bash -l
+
+#$-P coral
+#$-j y
+#$-N fastq_path
+#$-l h_rt=12:00:00
+#$-pe omp 16
+
+module load bcl2fastq/2.20
+module load cellranger/7.2.0
+
+cellranger mkref --genome=sym_cat_refgenome --fasta=holobiont_genome.fasta --genes=algae_ref5_filt.gtf
+
+```
+
+Now counts for concatonated genome with only host genes
+```{r}
+#count_host_cat_A3
+
+#!/bin/bash -l
+
+#$-P coral
+#$-j y
+#$-N fastq_path
+#$-l h_rt=24:00:00
+#$-pe omp 24
+
+module load bcl2fastq/2.20
+module load cellranger/7.2.0
+
+cellranger count \
+--id='A3_host_cat' \
+--description='Oculina A3' \
+--include-introns='true' \
+--sample='IM_DS_0616_A3' \
+--localcores=24 \
+--fastqs=/projectnb/coral/MVI_Oculina/10X_22_ApV2/outs/fastq_path/AAAT5WFHV/ \
+--transcriptome=/projectnb/coral/MVI_Oculina/10X_22_ApV2/outs/fastq_path/host_cat_refgenome
+
+#count_host_cat_S3
+#!/bin/bash -l
+
+#$-P coral
+#$-j y
+#$-N fastq_path
+#$-l h_rt=24:00:00
+#$-pe omp 24
+
+module load bcl2fastq/2.20
+module load cellranger/7.2.0
+
+cellranger count \
+--id='S3_host_cat' \
+--description='Oculina S3' \
+--include-introns='true' \
+--sample='IM_DS_0616_S3' \
+--localcores=24 \
+--fastqs=/projectnb/coral/MVI_Oculina/10X_22_ApV2/outs/fastq_path/AAAT5WFHV/ \
+--transcriptome=/projectnb/coral/MVI_Oculina/10X_22_ApV2/outs/fastq_path/host_cat_refgenome
+```
+
+
+First read in and set up just the S3_sym dataset -- I didn't end up using this because it identified so few cells and I'm not confident about them
+```{r}
+#Set up your experiment
+results_dir <- "cat_analysis"
+proj_name_lead <- "Oculina_cat"
+
+dir.create(results_dir, showWarnings = F)
+proj_name <- paste0(results_dir, "/", proj_name_lead)
+
+#Load in the data
+
+S3.sym.data <- Read10X(data.dir <- "/projectnb/coral/MVI_Oculina/10X_22_ApV2/outs/fastq_path/S3_sym_cat/outs/filtered_feature_bc_matrix/")
+
+# check for duplicated barcodes(column names) within a dataset
+any(duplicated(x = colnames(x = S3.sym.data)))
+#FALSE
+
+# Rename columns
+colnames(x = S3.sym.data) <- paste('S3', colnames(x = S3.sym.data), sep = '_')
+rownames(x = S3.sym.data) <- gsub("_", "-", rownames(S3.sym.data))
+head(rownames(S3.sym.data))
+length(rownames(S3.sym.data))
+#31969
+
+### Initialize the Seurat object with the raw, non-normalized data
+# Keep all genes expressed in >= 3 cells. 
+# Keep all cells with at least 200 or 100 detected genes, depending on how stringent you want it. Do 200 here for more stringent analysis
+S3_sym <- CreateSeuratObject(counts = S3.sym.data, 
+                             min.cells = 3, 
+                             min.features = 200, 
+                             project = "S3_sym")
+### add treatment/group status to objects
+S3_sym[["group"]] <- "S3_2F1"
+S3_sym@meta.data$group <- as.factor(S3_sym@meta.data$group)
+S3_sym[["condition"]] <- "sym"
+S3_sym@meta.data$condition <- as.factor(S3_sym@meta.data$condition)
+S3_sym[["individual"]] <- "F"
+S3_sym@meta.data$individual <- as.factor(S3_sym@meta.data$individual)
+str(S3_sym@meta.data)
+
+S3_sym
+#An object of class Seurat 
+#4130 features across 63 samples within 1 assay 
+#Active assay: RNA (4130 features, 0 variable features)
+
+S3_sym@meta.data
+
+S3_sym_cell_ids <- rownames(S3_sym@meta.data)
+```
+
+
+Okay sure now load in your host bits
+```{r}
+A3.host.data <- Read10X(data.dir <- "/projectnb/coral/MVI_Oculina/10X_22_ApV2/outs/fastq_path/A3_host_cat/outs/filtered_feature_bc_matrix/")
+S3.host.data <- Read10X(data.dir <- "/projectnb/coral/MVI_Oculina/10X_22_ApV2/outs/fastq_path/S3_host_cat/outs/filtered_feature_bc_matrix/")
+
+# check for duplicated barcodes(column names) within a dataset
+any(duplicated(x = colnames(x = A3.host.data)))
+#FALSE
+any(duplicated(x = colnames(x = S3.host.data)))
+#FALSE
+
+# Rename columns to avoid trouble when merging data sets
+colnames(x = A3.host.data) <- paste('A3', colnames(x = A3.host.data), sep = '_')
+colnames(x = S3.host.data) <- paste('S3', colnames(x = S3.host.data), sep = '_')
+rownames(x = A3.host.data) <- gsub("_", "-", rownames(A3.host.data))
+head(rownames(A3.host.data))
+rownames(x = S3.host.data) <- gsub("_", "-", rownames(S3.host.data))
+head(rownames(S3.host.data))
+
+#rename rownames
+length(gene2gene_symbol$gene_symbol)
+#45867
+length(rownames(A3.host.data))
+#47156
+length(rownames(S3.host.data))
+#47156
+
+#replace the "merged" from A3_rownames with ""
+A3.host.data_names <- A3.host.data
+A3_host_rownames <- as.data.frame(rownames(A3.host.data_names))
+colnames(A3_host_rownames) <-paste("X")
+A3_host_rownames$X <- gsub("MERGED%3A%20", "", A3_host_rownames$X)
+A3_host_gene2gene_symbol <- A3_host_rownames %>%
+  left_join(gene2gene_symbol, by=c("X"="gene"))
+A3_host_gene2gene_symbol <- 
+    transform(
+        A3_host_gene2gene_symbol ,
+        gene_symbol =
+            ifelse( is.na(gene_symbol), X, gene_symbol)) %>%
+  mutate(gene_symbol = make.names(gene_symbol, unique = TRUE))
+rownames(x=A3.host.data_names) <- A3_host_gene2gene_symbol$gene_symbol
+head(rownames(A3.host.data_names))
+head(rownames(A3.host.data))
+
+S3.host.data_names <- S3.host.data
+S3_host_rownames <- as.data.frame(rownames(S3.host.data_names))
+colnames(S3_host_rownames) <-paste("X")
+S3_host_rownames$X <- gsub("MERGED%3A%20", "", S3_host_rownames$X)
+S3_host_gene2gene_symbol <- S3_host_rownames %>%
+  left_join(gene2gene_symbol, by=c("X"="gene"))
+S3_host_gene2gene_symbol <- 
+    transform(
+        S3_host_gene2gene_symbol ,
+        gene_symbol =
+            ifelse( is.na(gene_symbol), X, gene_symbol)) %>%
+  mutate(gene_symbol = make.names(gene_symbol, unique = TRUE))
+rownames(x=S3.host.data_names) <- S3_host_gene2gene_symbol$gene_symbol
+head(rownames(S3.host.data_names))
+head(rownames(S3.host.data))
+
+### Initialize the Seurat object with the raw, non-normalized data
+
+A3_h_new <- CreateSeuratObject(counts = A3.host.data_names, 
+                             min.cells = 3, 
+                             min.features = 200, 
+                             project = "A3_host")
+S3_h_new <- CreateSeuratObject(counts = S3.host.data_names, 
+                             min.cells = 3, 
+                             min.features = 200, 
+                             project = "S3_host")
+### add treatment/group status to objects
+# add group
+A3_h_new[["group"]] <- "A3_2F8"
+S3_h_new[["group"]] <- "S3_2F1"
+A3_h_new@meta.data$group <- as.factor(A3_h_new@meta.data$group)
+S3_h_new@meta.data$group <- as.factor(S3_h_new@meta.data$group)
+
+# add condition
+A3_h_new[["condition"]] <- "apo"
+S3_h_new[["condition"]] <- "sym"
+
+A3_h_new@meta.data$condition <- as.factor(A3_h_new@meta.data$condition)
+S3_h_new@meta.data$condition <- as.factor(S3_h_new@meta.data$condition)
+
+# add individual
+A3_h_new[["individual"]] <- "F"
+S3_h_new[["individual"]] <- "F"
+
+A3_h_new@meta.data$individual <- as.factor(A3_h_new@meta.data$individual)
+S3_h_new@meta.data$individual <- as.factor(S3_h_new@meta.data$individual)
+
+str(A3_h_new@meta.data)
+str(S3_h_new@meta.data)
+
+A3_h_new
+#25107 features across 3866 samples within 1 assay 
+#Active assay: RNA (25107 features, 0 variable features)
+
+S3_h_new
+#25196 features across 3172 samples within 1 assay 
+#Active assay: RNA (25196 features, 0 variable features)
+
+#S3_host_cell_ids <- rownames(S3_h_new@meta.data)
+#sym_host_intersect <- intersect(S3_host_cell_ids, S3_sym_cell_ids)
+#8 of them
+```
+
+#### Start of quality control and filtering, etc
+```{r}
+# Calculate percentage of mitochondrial counts
+obj.list_h <- list(A3_h_new,
+                 S3_h_new)
+
+# Remove doublets - skipped
+# for (i in 1:length(obj.list)) {
+#   print(obj.list[[i]]@project.name)
+#   print(paste0("Number of cells: ", ncol(obj.list[[i]])))
+#   obj.list[[i]] <- obj.list[[i]][,intersect(colnames(obj.list[[i]]), singlet_cell_id)]
+#   print(paste0("Number of cells: ", ncol(obj.list[[i]])))
+#   print(" ")
+# }
+#as.data.frame((obj.list[1:3])) 
+
+rownames(obj.list_h[[1]]) %>% as.data.frame() %>% View()
+
+##This is what Matt had in his original script when I use it, no mit genes are identified
+#Add % of reads mapping to mitochondrial genes
+for (i in 1:length(obj.list_h)) {
+  obj.list_h[[i]] <- PercentageFeatureSet(obj.list_h[[i]], pattern = "^MT-", col.name = 'percent.mt')
+  obj.list_h[[i]][["per.mito.bin"]] <- ifelse(obj.list_h[[i]][["percent.mt"]] > 10, "> 10%", ifelse(obj.list_h[[i]][["percent.mt"]] > 5, "5%-10%", ifelse(obj.list_h[[i]][["percent.mt"]] > 2.5, "2.5%-5%", "< 2.5%")))
+}
+
+plts_h <- lapply(obj.list_h, function(x) VlnPlot(x, 
+                                             features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), 
+                                             group.by = "group",
+                                             pt.size = .25,
+                                             ncol = 3))
+
+patchwork::wrap_plots(plts_h, ncol = 1) 
+#not saving rn but previous version saved as qc_plot1.pdf with 6x6 measurements
+```
+
+Extra filtering (especially if we knew our mitochondrial genes)
+```{r}
+# Subset loop
+for (i in 1:length(obj.list_h)) {
+  print(obj.list_h[[i]]@project.name)
+  print(paste0("Number of cells: ", ncol(obj.list_h[[i]])))
+  obj.list_h[[i]] <- subset(obj.list_h[[i]], subset = nFeature_RNA > 200 & percent.mt < 15)
+  print(paste0("Number of cells: ", ncol(obj.list_h[[i]])))
+  print(" ")
+}
+
+#"A3_host"
+#[1] "Number of cells: 3866"
+#[1] "Number of cells: 3866"
+#[1] " "
+#[1] "S3_host"
+#[1] "Number of cells: 3172"
+#[1] "Number of cells: 3172"
+```
+
+The latest version of sctransform also supports using glmGamPoi package which substantially improves the speed of the learning procedure. It can be invoked by specifying method="glmGamPoi"
+- This is a process to normalize variation in sequencing depth and count data (kinda like log-transforming would do)
+- Information on SCTransform can be found here: https://satijalab.org/seurat/articles/sctransform_vignette.html
+```{r}
+obj.list_h <- lapply(X = obj.list_h, FUN = function(x) {
+    x <- SCTransform(x, 
+                     method = "glmGamPoi", 
+                     assay = "RNA",
+                     new.assay.name = "SCT",
+                     vars.to.regress = c('percent.mt', 'nFeature_RNA'),
+                     conserve.memory = TRUE,
+                     vst.flavor="v2")
+})
+
+features_h <- SelectIntegrationFeatures(object.list = obj.list_h, nfeatures = 3000)
+obj.list_h <- PrepSCTIntegration(object.list = obj.list_h, anchor.features = features_h)
+
+integration.anchors_h <- FindIntegrationAnchors(object.list = obj.list_h, normalization.method = "SCT", anchor.features = features_h)
+seurat_obj_h <- IntegrateData(anchorset = integration.anchors_h, normalization.method = "SCT")
+```
+
+The Seurat SCT vignette states that 30 PCs should be used, as this will increase performance
+```{r}
+# Run the standard workflow for visualization and clustering
+seurat_obj_h <- FindVariableFeatures(seurat_obj_h, selection.method = "vst", nfeatures = 2000)
+seurat_obj_h <- ScaleData(seurat_obj_h, verbose = FALSE, assay="RNA")
+
+seurat_obj_h <- RunPCA(seurat_obj_h)
+seurat_obj_h <- RunUMAP(seurat_obj_h, reduction="pca", dims=1:30)
+seurat_obj_h <- FindNeighbors(seurat_obj_h, reduction ="pca", dims=1:30)
+
+dir.create(paste0(results_dir, "/", "res_iter_h"))
+
+#running different resolutions of umaps, 0.1 calls bigger clusters and 1.5 calls smaller/distinct clusters
+
+#for (i in seq(.1, 1.5, by = .1)) {
+#  seurat_obj_tmp_h <- FindClusters(seurat_obj_h, resolution = i)
+#  DimPlot(seurat_obj_tmp_h, reduction = "umap", label = T) 
+#}
+
+# Make UMAP plots with resolution as 0.25, though this may change later
+seurat_obj_h <- FindClusters(seurat_obj_h, resolution = 0.25)
+plt1h <- DimPlot(seurat_obj_h, reduction = "umap", label = T)
+# saved as umap1h_025_011824.pdf as landscape 7x5
+plt2h <- DimPlot(seurat_obj_h, reduction = "umap", group.by = "group")
+
+#sym_cell_feat_plot <- DimPlot(seurat_obj_h, reduction = "umap", cells.highlight = sym_host_intersect, cols.highlight=c("black"))
+# saved as umap1h_8syms_011824.pdf as landscape 7x5
+```
+
+
+
+This is looking at the cat data
+```{r}
+A3.cat.data <- Read10X(data.dir <- "/projectnb/coral/MVI_Oculina/10X_22_ApV2/outs/fastq_path/A3_cat_cat/outs/filtered_feature_bc_matrix/")
+S3.cat.data <- Read10X(data.dir <- "/projectnb/coral/MVI_Oculina/10X_22_ApV2/outs/fastq_path/S3_cat_cat/outs/filtered_feature_bc_matrix/")
+
+# check for duplicated barcodes(column names) within a dataset
+any(duplicated(x = colnames(x = A3.cat.data)))
+#FALSE
+any(duplicated(x = colnames(x = S3.cat.data)))
+#FALSE
+
+# Rename columns to avoid trouble when merging data sets
+colnames(x = A3.cat.data) <- paste('A3', colnames(x = A3.cat.data), sep = '_')
+colnames(x = S3.cat.data) <- paste('S3', colnames(x = S3.cat.data), sep = '_')
+rownames(x = A3.cat.data) <- gsub("_", "-", rownames(A3.cat.data))
+head(rownames(A3.cat.data))
+rownames(x = S3.cat.data) <- gsub("_", "-", rownames(S3.cat.data))
+head(rownames(S3.cat.data))
+
+#rename rownames
+length(gene2gene_symbol$gene_symbol)
+#45867
+length(rownames(A3.cat.data))
+#79125
+length(rownames(S3.cat.data))
+#79125
+
+#replace the "merged" from A3_rownames with ""
+A3.cat.data_names <- A3.cat.data
+A3_cat_rownames <- as.data.frame(rownames(A3.cat.data_names))
+colnames(A3_cat_rownames) <-paste("X")
+A3_cat_rownames$X <- gsub("MERGED%3A%20", "", A3_cat_rownames$X)
+A3_cat_gene2gene_symbol <- A3_cat_rownames %>%
+  left_join(gene2gene_symbol, by=c("X"="gene"))
+A3_cat_gene2gene_symbol <- 
+    transform(
+        A3_cat_gene2gene_symbol ,
+        gene_symbol =
+            ifelse( is.na(gene_symbol), X, gene_symbol)) %>%
+  mutate(gene_symbol = make.names(gene_symbol, unique = TRUE))
+rownames(x=A3.cat.data_names) <- A3_cat_gene2gene_symbol$gene_symbol
+head(rownames(A3.cat.data_names))
+head(rownames(A3.cat.data))
+
+S3.cat.data_names <- S3.cat.data
+S3_cat_rownames <- as.data.frame(rownames(S3.cat.data_names))
+colnames(S3_cat_rownames) <-paste("X")
+S3_cat_rownames$X <- gsub("MERGED%3A%20", "", S3_cat_rownames$X)
+S3_cat_gene2gene_symbol <- S3_cat_rownames %>%
+  left_join(gene2gene_symbol, by=c("X"="gene"))
+S3_cat_gene2gene_symbol <- 
+    transform(
+        S3_cat_gene2gene_symbol ,
+        gene_symbol =
+            ifelse( is.na(gene_symbol), X, gene_symbol)) %>%
+  mutate(gene_symbol = make.names(gene_symbol, unique = TRUE))
+rownames(x=S3.cat.data_names) <- S3_cat_gene2gene_symbol$gene_symbol
+head(rownames(S3.cat.data_names))
+head(rownames(S3.cat.data))
+
+### Initialize the Seurat object with the raw, non-normalized data
+
+A3_c_new <- CreateSeuratObject(counts = A3.cat.data_names, 
+                             min.cells = 3, 
+                             min.features = 200, 
+                             project = "A3_cat")
+S3_c_new <- CreateSeuratObject(counts = S3.cat.data_names, 
+                             min.cells = 3, 
+                             min.features = 200, 
+                             project = "S3_cat")
+### add treatment/group status to objects
+# add group
+A3_c_new[["group"]] <- "A3_2F8"
+S3_c_new[["group"]] <- "S3_2F1"
+A3_c_new@meta.data$group <- as.factor(A3_c_new@meta.data$group)
+S3_c_new@meta.data$group <- as.factor(S3_c_new@meta.data$group)
+
+# add condition
+A3_c_new[["condition"]] <- "apo"
+S3_c_new[["condition"]] <- "sym"
+
+A3_c_new@meta.data$condition <- as.factor(A3_c_new@meta.data$condition)
+S3_c_new@meta.data$condition <- as.factor(S3_c_new@meta.data$condition)
+
+# add individual
+A3_c_new[["individual"]] <- "F"
+S3_c_new[["individual"]] <- "F"
+
+A3_c_new@meta.data$individual <- as.factor(A3_c_new@meta.data$individual)
+S3_c_new@meta.data$individual <- as.factor(S3_c_new@meta.data$individual)
+
+str(A3_c_new@meta.data)
+str(S3_c_new@meta.data)
+
+A3_c_new
+#25250 features across 3880 samples within 1 assay 
+#Active assay: RNA (25250 features, 0 variable features)
+
+S3_c_new
+#29669 features across 3190 samples within 1 assay 
+#Active assay: RNA (29669 features, 0 variable features)
+```
+
+```{r}
+# Calculate percentage of mitochondrial counts
+obj.list_c <- list(A3_c_new,
+                 S3_c_new)
+
+# Remove doublets - skipped
+# for (i in 1:length(obj.list)) {
+#   print(obj.list[[i]]@project.name)
+#   print(paste0("Number of cells: ", ncol(obj.list[[i]])))
+#   obj.list[[i]] <- obj.list[[i]][,intersect(colnames(obj.list[[i]]), singlet_cell_id)]
+#   print(paste0("Number of cells: ", ncol(obj.list[[i]])))
+#   print(" ")
+# }
+#as.data.frame((obj.list[1:3])) 
+
+rownames(obj.list_c[[1]]) %>% as.data.frame() %>% View()
+
+##This is what Matt had in his original script when I use it, no mit genes are identified
+#Add % of reads mapping to mitochondrial genes
+for (i in 1:length(obj.list_c)) {
+  obj.list_c[[i]] <- PercentageFeatureSet(obj.list_c[[i]], pattern = "^MT-", col.name = 'percent.mt')
+  obj.list_c[[i]][["per.mito.bin"]] <- ifelse(obj.list_c[[i]][["percent.mt"]] > 10, "> 10%", ifelse(obj.list_c[[i]][["percent.mt"]] > 5, "5%-10%", ifelse(obj.list_c[[i]][["percent.mt"]] > 2.5, "2.5%-5%", "< 2.5%")))
+}
+
+plts_c <- lapply(obj.list_c, function(x) VlnPlot(x, 
+                                             features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), 
+                                             group.by = "group",
+                                             pt.size = .25,
+                                             ncol = 3))
+
+patchwork::wrap_plots(plts_c, ncol = 1) 
+#not saving rn but previous version saved as qc_plot1.pdf with 6x6 measurements
+```
+
+```{r}
+# Subset loop
+for (i in 1:length(obj.list_c)) {
+  print(obj.list_c[[i]]@project.name)
+  print(paste0("Number of cells: ", ncol(obj.list_c[[i]])))
+  obj.list_c[[i]] <- subset(obj.list_c[[i]], subset = nFeature_RNA > 200 & percent.mt < 15)
+  print(paste0("Number of cells: ", ncol(obj.list_c[[i]])))
+  print(" ")
+}
+
+#"A3_host"
+#[1] "Number of cells: 3880"
+#[1] "Number of cells: 3880"
+#[1] " "
+#[1] "S3_host"
+#[1] "Number of cells: 3190"
+#[1] "Number of cells: 3190"
+```
+
+```{r}
+obj.list_c <- lapply(X = obj.list_c, FUN = function(x) {
+    x <- SCTransform(x, 
+                     method = "glmGamPoi", 
+                     assay = "RNA",
+                     new.assay.name = "SCT",
+                     vars.to.regress = c('percent.mt', 'nFeature_RNA'),
+                     conserve.memory = TRUE,
+                     vst.flavor="v2")
+})
+
+features_c <- SelectIntegrationFeatures(object.list = obj.list_c, nfeatures = 3000)
+obj.list_c <- PrepSCTIntegration(object.list = obj.list_c, anchor.features = features_c)
+
+integration.anchors_c <- FindIntegrationAnchors(object.list = obj.list_c, normalization.method = "SCT", anchor.features = features_c)
+seurat_obj_c <- IntegrateData(anchorset = integration.anchors_c, normalization.method = "SCT")
+```
+
+```{r}
+# Run the standard workflow for visualization and clustering
+seurat_obj_c <- ScaleData(seurat_obj_c, verbose = FALSE, assay="RNA")
+
+seurat_obj_c <- RunPCA(seurat_obj_c)
+seurat_obj_c <- RunUMAP(seurat_obj_c, reduction="pca", dims=1:30)
+seurat_obj_c <- FindNeighbors(seurat_obj_c, reduction ="pca", dims=1:30)
+
+dir.create(paste0(results_dir, "/", "res_iter_c"))
+
+# Make UMAP plots with resolution as 0.25, though this may change later
+seurat_obj_c <- FindClusters(seurat_obj_c, resolution = 0.25)
+plt1c <- DimPlot(seurat_obj_c, reduction = "umap", label = T)
+plt2c <- DimPlot(seurat_obj_c, reduction = "umap", group.by = "group")
+# saved as umap1c_025_012324.pdf as portrait 10x7
+
+```
+
+What I probably have to do is look at what cells/clusters have a lot of the sym genes expressed
+
+None of this worked bc things are mapping wrong
+```{r}
+#DefaultAssay(seurat_obj_c) <- "RNA"
+#seurat_obj_c@meta.data$seurat_clusters <- as.numeric(as.character(seurat_obj_c@meta.data$seurat_clusters))+1
+#Idents(seurat_obj_c)<- "seurat_clusters"
+#seurat_obj_c$seurat_clusters
+#seurat_obj_c@active.ident <- factor(x = seurat_obj_c@active.ident, levels = 1:19)
+#seurat_obj_c@active.ident
+
+saveRDS(seurat_obj_c, paste0(proj_name, '_seurat-obj_c_012324.rds'))
+seurat_obj_c <- readRDS(file.choose())
+```
+
+look at proportion of cells per cluster in each library
+
+this is just the preliminary check, will redo these down the road
+```{r}
+count_per_cluster <- table(Idents(seurat_obj_c), seurat_obj_c@meta.data$group)
+percent_per_cluster <- prop.table(table(Idents(seurat_obj_c), seurat_obj_c@meta.data$group), margin = 2)
+
+count_per_cluster
+percent_per_cluster
+
+as.data.frame(count_per_cluster) %>%
+  mutate(Cluster = Var1,
+         Condition = Var2) %>%
+  ggplot(., aes(Cluster, Freq, fill = Condition)) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  theme_classic()
+
+#proportions
+as.data.frame(percent_per_cluster) %>%
+  mutate(Cluster = Var1,
+         Condition = Var2) %>%
+  ggplot(., aes(Cluster, Freq, fill = Condition)) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  theme_classic()
+```
+
+One method for finding marker genes
+```{r}
+markers_c <- FindAllMarkers(seurat_obj_c, 
+                          min.pct = -Inf, 
+                          logfc.threshold = .5, 
+                          only.pos = T, 
+                          test.use = "MAST",
+                          latent.vars = c('percent.mt', 'nFeature_RNA'))
+
+
+markers_c <- markers_c %>%
+  filter(avg_log2FC > 0)
+nrow(markers_c)
+#2344
+
+markers_fullnames_c <- markers_c
+rownames(markers_fullnames_c) =NULL
+head(markers_fullnames_c)
+head(seq2iso2gene)
+col_names <- c("p_val", "avg_log2FC", "pct.1", "pct.2", "p_val_adj", "cluster", "gene_symbol")
+colnames(markers_fullnames_c) <- col_names
+markers_fullnames_c <- markers_fullnames_c %>%
+  left_join(seq2iso2gene) %>%
+  write_csv(paste0(proj_name, '_HighlyEnrichedMarkers_cat_012324_logFC.5.csv'))
+
+markers_fullnames_c <- read.csv(file.choose())
+head(markers_fullnames_c)
+
+FeaturePlot(object =seurat_obj_c, features = c("Sym.152125.c5.g2.i4"), split.by = "condition") 
+```
+
+I don't know how to make this work, some of the symbiont genes are super dispersed throughout all the clusters, some are in specific clusters, some are higher in sym and some are higher in apo, altogether which makes me not confident that these reads are actually mapping to the symbionts and not just random oculina reads
+
+I think what I'm going to try to do is find the LePin ortholog and see where that takes me
+
+- EVM%20prediction%20chromosome-8.904 is Fibrillin-2 FBN2.7 - run through conserved domain and has C-type lectin and n-term Kazal domains; expressed in very few cells in both apo and sym mostly in gderm
+- EVM%20prediction%20chromosome-6.160 is E3 ubiquitin-protein ligase SH3RF1 - no domains on ncbi
+- EVM%20prediction%20chromosome-8.486 is Hemicentin-1 HMCN1.41 - c-type lectins, h-type lectins, kazal domain; only in one cell in apo
+- EVM%20prediction%20chromosome-14.6107 is Angiopoietin-related protein 7 ANGL7.14 - has C-type lectin and n-term Kazal domains; not in the seurat object
+- EVM%20prediction%20chromosome-8.836 is Deleted in malignant brain tumors 1 protein - no conserved domains
+- EVM%20prediction%20chromosome-8.491 is Deleted in malignant brain tumors 1 protein PGCA.26 - has c-type, h-type lectins, and kazal; in very few cells
+- EVM%20prediction%20chromosome-8.819 is Versican core protein CSPG2.9 - no conserved domains
+- EVM%20prediction%20chromosome-8.512 is Aggrecan core protein PGCA.25 - kazal and c-lect domains; in very few cells
+- EVM%20prediction%20chromosome-8.823 is Deleted in malignant brain tumors 1 protein - no conserved domains
+- EVM%20prediction%20chromosome-8.431 is Fibrillin-1 FBN1.6 - c-type lectin and kazal domains; in like one sym cell
+
+went through so many other genes in the same way and didn't find anything that looked like it had promising expression
+
+
+Back to just the host (with sym-mapping reads removed)
+```{r}
+DefaultAssay(seurat_obj_h) <- "RNA"
+seurat_obj_h@meta.data$seurat_clusters <- as.numeric(as.character(seurat_obj_h@meta.data$seurat_clusters))+1
+Idents(seurat_obj_h)<- "seurat_clusters"
+seurat_obj_h$seurat_clusters
+seurat_obj_h@active.ident <- factor(x = seurat_obj_h@active.ident, levels = 1:16)
+seurat_obj_h@active.ident
+
+saveRDS(seurat_obj_h, paste0(proj_name, '_seurat-obj_host_012524.rds'))
+seurat_obj_h <- readRDS(file.choose())
+```
+
+Find cell number and percent in each cluster
+-this is just the preliminary check, will redo these down the road
+```{r}
+count_per_cluster_h <- table(Idents(seurat_obj_h), seurat_obj_h@meta.data$group)
+percent_per_cluster_h <- prop.table(table(Idents(seurat_obj_h), seurat_obj_h@meta.data$group), margin = 2)
+
+count_per_cluster_h
+percent_per_cluster_h
+
+as.data.frame(count_per_cluster_h) %>%
+  mutate(Cluster = Var1,
+         Condition = Var2) %>%
+  ggplot(., aes(Cluster, Freq, fill = Condition)) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  theme_classic()
+
+#this is more what Matt was talking about; proportions
+as.data.frame(percent_per_cluster_h) %>%
+  mutate(Cluster = Var1,
+         Condition = Var2) %>%
+  ggplot(., aes(Cluster, Freq, fill = Condition)) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  theme_classic()
+```
+
+One method for finding marker genes, there are multiple ways of doing this
+```{r}
+markers_h <- FindAllMarkers(seurat_obj_h, 
+                          min.pct = -Inf, 
+                          logfc.threshold = .5, 
+                          only.pos = T, 
+                          test.use = "MAST",
+                          latent.vars = c('percent.mt', 'nFeature_RNA'))
+
+
+
+markers_h <- markers_h %>%
+  filter(avg_log2FC > 0)
+nrow(markers_h)
+#1620
+
+markers_fullnames_h <- markers_h
+rownames(markers_fullnames_h) =NULL
+head(markers_fullnames_h)
+head(seq2iso2gene)
+col_names <- c("p_val", "avg_log2FC", "pct.1", "pct.2", "p_val_adj", "cluster", "gene_symbol")
+colnames(markers_fullnames_h) <- col_names
+markers_fullnames_h <- markers_fullnames_h %>%
+  left_join(seq2iso2gene) %>%
+  write_csv(paste0(proj_name, '_HighlyEnrichedMarkers_host_012524_logFC.5.csv'))
+
+markers_fullnames_h <- read.csv(file.choose())
+head(markers_fullnames_h)
+
+#FeaturePlot(object =seurat_obj_c, features = c("Sym.152125.c5.g2.i4"), split.by = "condition") 
+```
+
+Now defining cell types
+```{r}
+#make "oculina" to manipulate around with and keep seurat_obj pure
+oculina_h <- seurat_obj_h
+oculina_h@meta.data
+oculina_h@active.ident
+head(oculina_h)
+```
+
+Pick marker genes defined in previous (Xenia and Spist) datasets to help you define your cells
+```{r}
+head(oculina_h@assays)
+plt1hn <- DimPlot(oculina_h, reduction = "umap", label=T)
+
+#TF highly expressed in spist cnidocytes
+pax6 <- c("PAX6", "PAX6.1", "PAX6.2") #ns
+six1 <- c("SIX1B", "SIX1B.1") #not sig here
+six2 <- c("SO") #ns
+
+#TF highly expressed in spist gastrodermis etc
+foxc2 <- c("FXC2B") #spist gastro muscle, not sig
+deaf1 <- c("DEAF1") #spist gastro muscle, ns
+erg <- c("ERG") #all spist gastros, marker gene for 2 and 5; in lots of cells (1, 2, 3, 5, 7 a bit, 8, 9 a bit, 11a a bit, 13a a bit)
+fli1 <- c("FLII") #same spist as erg, ns here
+etv6 <- c("ETV6.1") #gastro algal hosting in spist, ns
+elf2 <- c("ELF2") #gastro algal hosting in spist, no sig
+elf4 <- c("ELF4.1", "ETS1A.3") #gastro algal hosting in spist, first is marker for 12, second for 10 and in 12; first is also in 2, 3, 5, 10, 11s, 12, 16s
+spdef <- c("SPDEF") #gastro algal hosting in spist, marker for 10 and 16 here; also in 5s
+usf2 <- c("USF2", "USF2.1") #in gastrodermis in spist but ns here
+otx1 <-c("OTX1", "OTX1B", "OTX1B.1") #gastro in spist, otx1b is in 5s
+six4_6 <- c("SIX4", "SIX6") #ns
+
+#TFs for neuron
+gata2 <- c("GATA2") #no sig
+pax7 <- c("PAX7", "PAX7.1", "PAX7.2") #pax7 is marker gene for 3; maybe neuronal TF; some other cells
+asc <- c("ASCC1", "ASCC2", "ASCC3") #ns
+pou4 <- c("PO4F3") #ns but could be highest in 4
+islet <- c("ICA69") #ns
+tbx20 <- c("TBX20.2") #marker for 12
+
+#TFs for Immune
+irf1 <- c("IRF1") #marker gene for 11
+irf2 <- c("IRF2", "IRF2.1", "IRF2.2", "IRF2.3") # 2.1 and 2.2 are marker genes for 11, ns for the others
+nfat5 <- c("NFAT5.4") #marker gene for 2 and 5 but high in everything; immune marker in spistillata but could be anything
+atf3 <- c("ATF3") #marker for 11 and higher in sym
+atf5 <- c("ATF5") #marker for 9 but high in everthing
+
+#TFs for spist epidermis 
+pax2 <- c("PAX2", "PAX2A", "PAX2A.1", "PAX2A.2") #ns
+pax8 <- c("PAX8", "PAX8.1", "PAX8.2", "PAX8.3", "PAX8.4", "PAX8.5", "PAX8.6", "PAX8.7") #ns
+bach <- c("BACH", "BACH.1") #ns
+nfe2 <- c("NF2L1") #high in everything
+
+#TFs for spist gland
+rfx <- c("RFX6") #marker for 9 and 13
+
+###random genes of interest from spist paper (F1)
+
+#cnidocyte (minicollagen but we don't have that)
+tal2 <- c("TAL2.4") #tachylectins or galactosamine binding lectins, marker for 6 (this is the closest i can find to galactose binding lectin) and a tiny bit in 14 maybe?
+
+#immune
+alps <- c("ALPS.1") #Anti-lipopolysaccharide factor, marker for 11, immune cell linked in spistillata; higher in sym
+ikka <- c("IKKA") #marker for 13; also high in 1s, 4s, 5s, 8, 9s, 10s, 11s, 12a, 16s
+ikbp1 <- c("IKBP1") #ns
+ilf2 <- c("ILF2") #low in 1, 5s, 8
+hsp70 <- c("HSP71.1", "HSP71", "HSP7C.1") #marker for 11 (first), and 16 (third, also in all)
+hsp90 <- c("H90A1", "HSP97") #first is marker for 1 but in all cells; second is marker for 11 also in a lot of cells
+alphaA <- c("L2EFL.1") #alpha-crystallin A, marker for 9 (in 9a)
+alphaB <- c("CRYAB") #alpha-crystallin B, marker for 11
+cathepsin <- c("CATL.1", "CATL.3", "CATB.1") #lots of cathepsin marker genes in 1, 5, and 11; also in 2 and 8 (third one)
+bcl2 <- c( "BCL2") #bcl2 is marker for 11; in lots of cells
+#other random immune genes
+nfkb1 <- c("NFKB1") #ns
+nfkb2 <- c("EVM.20prediction.20chromosome.14.588") #ns
+my881 <- c("MY88A") #ns
+bcl3 <- c("BCL3", "BCL3.1") #ns
+lbp <- c("LBP", "LBP.1", "LBP.2", "LBP.3") # lbp.3 marker for 11 (in mostly 11s)
+prosaposin <- c("SAP") # marker for 1 and 5 kinda in a lot (including 11)
+endop <- c("EVM.20prediction.20chromosome.2.801") #endonuclease domain containing protein; idk if TF; marker for 11
+cd36 <- c("CD36", "CD36.1", "CD36.2") #ns
+sting <- c("STING", "STING.1", "STING.2", "STING.3", "STING.4", "STING.5") #ns
+ifih1 <- c("IFIH1", "IFIH1.1", "IFIH1.2") #ns interferon-induced helicase c domain-containing protein
+dock <- c("DOCK1", "DOCK3", "DOCK7", "DOCK9") #dedicator of cytokinesis; dock9 in 7s and 16s
+gbp6 <- c("GBP6.6", "GBP4.3") #markers for 11, guanylate binding protein 6; NICE
+rab43 <- c("RAB43", "RAB43.1") #ns
+bag <- c("BAG1", "BAG4", "BAG.2", "BAG.1") #BAG family molecular chaperone regulator 1 and 4 (ns) and IgA FC receptor; bag.1 is marker for 7; bag.2 is marker for 7 and 16
+apoptosis <- c("BFAR", "BAX", "SIVA", "AR1", "CFLAR") #apoptosis regulators; ns
+casp3 <- c("CASP3.2") #caspase3 marker for 11
+mvp <- c("MVP", "MVP.1", "MVP.2") #major vault protein; MVP is in a lot of things; MVP marker for 11 and high in others; mvp.2 also in 11; 
+ttc28 <- c("TTC28.15", "TTC28.32", "TTC28.26", "TTC28.240", "TTC28.118", "TTC28.152") #markers for 12; Tetratricopeptide repeat protein 28 
+
+#gastro
+tropomyosin <- c("TPM2", "TPM2.1", "TPM.1", "TPM.2", "TPM.6") #markers for 1 and 5; 9; 7; 11
+apoB <- c("APOB.1") #apolipoprotein marker for 5; also in 1s, 2s, 8s
+aplp <- c("APLP") #apolipophorin marker for 1, 2, 5 also in 8 a bit
+galk <- c("GALK1", "GALK2") #galactokinase; first in 1
+carb <- c("CAH2", "CAH2.2", "CAH2.5", "CAH2.6") #carbonic anhydrase; high exp in algal-hosting cells in spist; first is marker for 3, 7; second for 7; third for 7 and 16; fourth for 7
+npc2 <- c("NPC2", "NPC2.5", "NPC2.6", "NPC2.7") #markers for 1 (2.5 and 2.7; 2.7 also in 8s, 16s, and 12a) and 11
+
+#others to note some of which are 2 markers: granulins (2,5), S2611 (transporter, 1), lysosome associated things (LAMP1.1 in 1 and 5), GRP78 (glucose-reg, 13 and 16), PLCL.5 and .1 (2, 5, 13), glutamic acid-rich proteins in 4, 8, 11, 16; tubulins as markers for 1, 4, 6, 7, 8, 11, 16; CMLO2.3 and NAT8L (acetyltransf., 2); acid phosphatase (1 and 14 maybe?)
+
+#mitotic/germline
+#lots of tubulins in 8
+#lots of cyclins in 8
+sy65 <- c("SYT1", "SY65", "CO6A5.7", "ESYT3") #synaptotagmin, mitotic marker in spist; second in 9a; fourth in 1s, 3, 5s, 7s, 13s, 16s
+
+#epidermis
+pxdn <- c("PXDN.10", "PXDN.18") #first is marker for 3
+moxd1 <- c("MOXD1.11", "MOXD1.1", "MOXD1") #DBH-like monooxygenase protein, all marker genes 9; first is also marker for 1 (also is in 2, 5, and 8s)
+gst1 <- c("GST1.2","MGST1") #first is marker for 7 and 11; second is marker for 1 and 9; both in some other cells too
+cadh <- c("FAT4.10", "FAT2.1", "PCDL") #fat2.1 marker for 4; pcdl marker for 10, meh
+
+#neuron
+pkd1 <- c("PKD1.1") #marker for 10
+dclk2 <- c("DCLK2.1") #marker for 4 also in others
+cel3b <- c("CEL3B") #chymotrypsin-like elastase family member 3B, marker for 4
+cabp5 <- c("CABP5") #calcium binding protein 5, calcium gated channel (neuron-y), high in 12
+trpa <- c("TRPA1.17") #marker for 14 idk also high in 6s
+atoh8 <- c("ATOH8") #neuron marker in spist, ns
+kcn <- c("KCNF1", "KCNAE") #potassium voltage gated channel thing markers for 10
+cbpd <- c("CBPA2.2", "CBPD.3", "CBPB1", "CBPA4") #carboxypeptidase, marker for 4, 13, 14, 16 resp; meh
+lwa <- c("LWA.1") #marker for 4
+chymo <- c("CEL3B", "CPP1.13", "CTRL.2", "CEL2A.4", "PLMN.2", "TMPS3", "CTRA.1") #all could be chymptrypsin homologs; markers for 14 (only last two); cel3b, ctrl.2, plmn.2, and cpp1.13 markers for 4
+achr <- c("EVM.20prediction.20chromosome.10.1175") #marker for 7 and 16, acetylcholine receptor subunit
+cabo <- c("CABO.1") #squidulin (calmodulin homolog) marker for 4, 10, 12, 15, 16
+calm <- c("CALM.12") #calmodulin, marker for 8, 9, but in a lot of cells
+cac1 <- c("CAC1A") #marker for 10; voltage-dep calcium channel
+scn <- c("SCN2A") #marker for 10; sodium channel
+
+#gland
+olm2 <- c("OLM2A.6", "OLM2B") #olfactomedin, marker for cluster 13
+muc5a <- c("MUC5A") #mucin 5AC in 6 and 14 #lots of mucins in 3, 6, 7, 14, 16
+mlp <- c("MLP.12", "MLP") #mucin-like proteins, mlps also in 1, 3, 7 as well; mlp.12 marker for 6
+#lots of mlrp integumentary mucins in 16
+#lots of fbc fibrinogen in 13, 15
+
+#calicoblast
+hemopexin <- c("EPRA1.2") #ns but highest in 14
+myof <- c("MYOF","MYOF.5") #myoferlin/dysferlin marker for 3, 7 (first); both expressed in some other cells too
+
+VlnPlot(object =oculina_h, features = myof, pt.size= 0,combine = F,assay = "RNA", split.by = "condition") 
+
+#The default behaviour of split.by has changed.
+#Separate violin plots are now plotted side-by-side.
+#To restore the old behaviour of a single split violin,
+#set split.plot = TRUE.
+```
+
+
+Predictions:
+- Gastro: 1, (cathepsins, tropo, apoB, aplp, galk1, npc2, granulins, S2611, lamp), 5 (erg, spdef, otx1b, cathepsins, tropo, apoB, aplp, granulins, lamp), 2 (erg, cathepsins, apoB, aplp), 8 (cathepsin, aplp, npc2, glutamic acid-rich)
+    ?? 11 (tropo, cathepsin, npc2), 7 (tropo, carb), 12 (elf4), 9 (tropo)
+
+- Epi: 3 (pxdn)
+    9? (moxd1, MGST1), 7? (GST)
+
+- Neuron: 4 (pou4, dclk2, cel3b, lwa, cabo), 12 (tbx20, cabp5, cabo); 10 (pkd, kcn, cac1a, scn, cabo)
+    ?? 3 (pax7), 8 (calm), 9 (calm)
+
+- Immune: 11 (irf1, irf2, alps.1, hsp71.1, hsp97, alphaB, catl, bcl2, lbp.3, endop, gbp6, casp3, mvp, ttc28)
+
+- Gland: 13 (rfx, olm2, fbc); 6 (muc5a); 14 (muc5a); 16 (muc5a, mlrp); 15 (fbc)
+    9 (rfx)
+
+- Cnido: 6 (tal2)
+
+
+1 (gastrodermal)
+2 (gastrodermal)
+3 (epidermal)
+4 (neuron)
+5 (gastrodermal)
+6 (cnidocyte)
+7 (epidermal)
+8 (gastrodermal)
+9 (gland)
+10 (neuron)
+11 (immune)
+12 (neuron)
+13 (gland)
+14 (gland)
+15 (gland)
+16 (gland)
+
+
+Rename cell clusters with new names
+```{r}
+oculina_named_h <- RenameIdents(oculina_h, "1" = "Gastrodermis 1")
+oculina_named_h <- RenameIdents(oculina_named_h, "2" = "Gastrodermis 2")
+oculina_named_h <- RenameIdents(oculina_named_h, "3" = "Epidermis 1")
+oculina_named_h <- RenameIdents(oculina_named_h, "4" = "Neuron 1")
+oculina_named_h <- RenameIdents(oculina_named_h, "5" = "Gastrodermis 3")
+oculina_named_h <- RenameIdents(oculina_named_h, "6" = "Cnidocyte")
+oculina_named_h <- RenameIdents(oculina_named_h, "7" = "Epidermis 2")
+oculina_named_h <- RenameIdents(oculina_named_h, "8" = "Gastrodermis 4")
+oculina_named_h <- RenameIdents(oculina_named_h, "9" = "Gland 1")
+oculina_named_h <- RenameIdents(oculina_named_h, "10" = "Neuron 2")
+oculina_named_h <- RenameIdents(oculina_named_h, "11" = "Immune Cell")
+oculina_named_h <- RenameIdents(oculina_named_h, "12" = "Neuron 3")
+oculina_named_h <- RenameIdents(oculina_named_h, "13" = "Gland 2")
+oculina_named_h <- RenameIdents(oculina_named_h, "14" = "Gland 3")
+oculina_named_h <- RenameIdents(oculina_named_h, "15" = "Gland 4")
+oculina_named_h <- RenameIdents(oculina_named_h, "16" = "Gland 5")
+
+
+levels(oculina_named_h)
+levels(oculina_named_h) <- c("Gastrodermis 1", "Gastrodermis 2", "Gastrodermis 3", "Gastrodermis 4", "Neuron 1", "Neuron 2", "Neuron 3", "Epidermis 1", "Epidermis 2", "Cnidocyte", "Gland 1", "Gland 2", "Gland 3", "Gland 4", "Gland 5", "Immune Cell")
+levels(oculina_named_h)
+
+DefaultAssay(oculina_named_h) <- "RNA"
+saveRDS(oculina_named_h, paste0(proj_name, '_oculinanamed_host_012524.rds'))
+oculina_named_h <- readRDS(file.choose())
+
+col_hex <- c("#333333" ,"#E6B8BF", "#B33E52","#CC7A88", "#990F26","#FF99CC", "#FF9330", "#CFE6B8", "#78B33E", "#B8DEE6", "#3E9FB3", "#7ABECC",  "#C7B8E6", "#967ACC", "#653EB3",  "#9966CC")
+
+plot1 <- DimPlot(oculina_named_h, reduction = "umap", label=F, order=c("Gastrodermis 1", "Gastrodermis 2", "Gastrodermis 3", "Gastrodermis 4", "Neuron 1", "Neuron 2", "Neuron 3", "Epidermis 1", "Epidermis 2", "Cnidocyte", "Gland 1", "Gland 2", "Gland 3", "Gland 4", "Gland 5", "Immune Cell"), label.size = 3, cols=alpha(col_hex, 0.5)) 
+LabelClusters(plot1, id = "ident", size = 3, repel = T,  box.padding = 0.2, fontface="bold") + theme(legend.text=element_text(size=10))
+#umap_oculina_h_clusternames_012524 as landscape 7.5x5.5
+
+plot2 <- DimPlot(oculina_named_h, reduction = "umap", label=F,  shuffle=TRUE, group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + ggtitle("") + theme(legend.text=element_text(size=10))
+#umap_oculina_h_clusternames_aposym_012524 as landscape 7.5x5.5
+#might have to alter this some
+
+
+```
+
+Once again doing cells per cluster and percent per cluster, but this is the real one
+```{r}
+count_per_cluster <- table(Idents(oculina_named_h), oculina_named_h@meta.data$condition)
+percent_per_cluster <- prop.table(table(Idents(oculina_named_h), oculina_named_h@meta.data$condition), margin = 2)
+
+count_per_cluster
+percent_per_cluster
+
+count_cluster <- as.data.frame(count_per_cluster) %>%
+  mutate(Cluster = Var1,
+         Condition = Var2) %>%
+  ggplot(., aes(Cluster, Freq, fill = Condition)) +
+  geom_bar(stat = 'identity', position = 'dodge', color="black", width=0.6) +
+  scale_fill_manual(values=alpha(c("gray40", "#CC6600"), 0.75))+
+  ylab("Number of Cells")+
+  coord_flip()+
+  theme(panel.background = element_rect(color="black", fill="white"),
+        panel.grid.major = element_line(colour = "gray80", linewidth = 0.5, linetype="dotted"))
+  #theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+# saved as counts_per_cluster_oculina_h_012624.pdf as landscape with 7x5
+
+prop_cluster <- as.data.frame(percent_per_cluster) %>%
+  mutate(Cluster = Var1,
+         Condition = Var2) %>%
+  ggplot(., aes(Cluster, Freq, fill = Condition)) +
+  geom_bar(stat = 'identity', position = 'dodge', color="black", width=0.6) +
+  scale_fill_manual(values=alpha(c("gray40", "#CC6600"), 0.75))+
+  ylab("Proportion of Cells per Library")+
+  coord_flip()+
+  theme(panel.background = element_rect(color="black", fill="white"),
+        panel.grid.major = element_line(colour = "gray80", linewidth = 0.5, linetype="dotted"))
+# saved as prop_per_cluster_oculina_h_012624 as landscape with 7x5
+
+```
+
+Top 10 expressed genes in each cluster
+```{r}
+#get the top10 from the re-leveled oculina_named seurat object
+oc_markers_level_h<- FindAllMarkers(oculina_named_h, only.pos = TRUE, min.pct = 0.25, thresh.use = 0.25)
+nrow(oc_markers_level_h)
+#2547
+
+oc_markers_level_h %>% group_by(cluster) %>% top_n(10, avg_log2FC) -> top10_lev_h
+top10_lev_h
+nrow(top10_lev_h)
+#160
+#gives the top 10 genes for each cluster; 16 clusters
+saveRDS(top10_lev_h, paste0(proj_name, '_top10_h_releveled_named_012624.rds'))
+
+#do top20
+oc_markers_level_h %>% group_by(cluster) %>% top_n(20, avg_log2FC) -> top20_lev_h
+top20_lev_h
+nrow(top20_lev_h)
+#320
+saveRDS(top20_lev_h, paste0(proj_name, '_top20_h_releveled_named_012624.rds'))
+
+col_hex_hm <- c("#9966CC", "#653EB3", "#967ACC", "#C7B8E6", "#7ABECC", "#3E9FB3", "#B8DEE6", "#78B33E", "#CFE6B8","#FF9330","#FF99CC",  "#990F26", "#CC7A88", "#B33E52", "#E6B8BF",  "#333333")
+
+color<-colorRampPalette(brewer.pal(n=9, name="Reds"),bias=0.5)(20)
+
+DoHeatmap(oculina_named_h, features = top10_lev_h$gene,label=F, group.colors = col_hex_hm) + theme(axis.text.y= element_text(size=0)) + scale_fill_gradientn(colors=color)
+#saved as top10_h_releveled_named_012624 as landscape 8x6
+
+DoHeatmap(oculina_named_h, features = top20_lev_h$gene,label=F, group.colors = col_hex_hm) + theme(axis.text.y= element_text(size=0)) + scale_fill_gradientn(colors=color)
+#saved as top20_h_releveled_named_012624 as landscape 8x6
+
+#maybe rename "Identity" in the legend to something like "cell type"
+```
+
+Trying dotplot of features for immune cells
+```{r}
+immune_features_small <- c("ALPS.1", "IRF1","IRF2.1", "IRF2.2", "ATF3", "HSP71.1", "CRYAB", "LBP.3", "EVM.20prediction.20chromosome.2.801", "GBP6.6", "CASP3.2", "TTC28.15", "TTC28.32", "TTC28.26", "TTC28.240", "TTC28.118")
+immune_features_smaller <- c("ALPS.1", "IRF1","IRF2.1", "IRF2.2", "ATF3", "HSP71.1", "CRYAB", "LBP.3", "GBP6.6", "CASP3.2", "TTC28.15", "TTC28.32", "TTC28.26", "TTC28.240", "TTC28.118")
+
+# Dot plots - the size of the dot corresponds to the percentage of cells expressing the feature in each cluster. The color represents the average expression level
+DotPlot(oculina_named_h, features = immune_features_small) + RotatedAxis()
+#saved as oculina_h_named_dotplot_immunefeaturessmall as 8.7 landscape
+DotPlot(oculina_named_h, features = immune_features_smaller) + RotatedAxis()
+#saved as oculina_h_named_dotplot_immunefeaturessmaller as 7.5x4.5
+
+#FeaturePlot(oculina_named_h, features = immune_features_small)
+```
+
+Try to use feature plot to identify algal-hosting cells
+```{r}
+#granulins
+grn_feats <- c("GRN", "GRN.1", "GRN.2", "GRN.3", "GRN.4", "GRN.5", "GRN.6")
+FeaturePlot(oculina_named_h, features = grn_feats, split.by = "condition")
+#not really only in sym or anything
+#GRN.5 is marker for Gastro 1 and Gastro 3
+grn.5_feat <- FeaturePlot(oculina_named_h, features = c("GRN.5"), split.by = "condition")
+#grn.5_feat_oculina_h
+grn.5_vln <- VlnPlot(object =oculina_named_h, features = c("GRN.5"), pt.size= 0,combine = F,assay = "RNA", group.by = "condition", cols=c("gray40", "#CC6600"))
+#grn.5_vln_oculina_h_1
+#grn.5_vln_oculina_h_2
+```
+
+Now take genes from proteins of interest that have been identified as diff expressed in apo vs sym through JK's proteomics
+```{r}
+#in immune group
+proto_myd88 <- c("MYD88","MYD88.1","MYD88.2","MY88A","MY88A.1")
+myd88_feat_plot <- FeaturePlot(oculina_named_h, features = proto_myd88) #kinda in a lot of clusters and not just in apo or sym
+myd88_vln <- VlnPlot(object =oculina_named_h, features = proto_myd88, pt.size= 0,combine = F,assay = "RNA", split.by = "condition", cols=c("gray40", "#CC6600")) #nah
+
+proto_tmem175 <- c("TM175","TM175.1","TM175.2")
+tmem175_feat_plot <- FeaturePlot(oculina_named_h, features = proto_tmem175) #not very strong
+
+proto_vamp <- c("VAMP7","VAMP1","VAMP4")
+vamp_feat_plot <- FeaturePlot(oculina_named_h, features = proto_vamp) #spread and not strong, not clear apo/sym diff
+vamp_vln <- VlnPlot(object =oculina_named_h, features = proto_vamp, pt.size= 0,combine = F,assay = "RNA", split.by = "condition", cols=c("gray40", "#CC6600")) #nah
+
+proto_dlg <- c("DLG1","DLG5")
+dlg_feat_plot <- FeaturePlot(oculina_named_h, features = proto_dlg, split.by = "condition")
+#saved as dlg_feat_plot_split
+dlg_vln <- VlnPlot(object =oculina_named_h, features = proto_dlg, pt.size= 0,combine = F,assay = "RNA", split.by = "condition", cols=c("gray40", "#CC6600")) #i don't really know much about this one so not going to worry about it, could be interesting tho
+
+proto_sfxn1 <- c("SFXN1")
+sfxn1_feat_plot <- FeaturePlot(oculina_named_h, features = proto_sfxn1, split.by = "condition") #nah
+
+proto_ctrb <- c("CTRB","CTRB.3","CTRB.4","CTRB.6","CTRB.7","CTRB.8")
+ctrb_feat_plot <- FeaturePlot(oculina_named_h, features = proto_ctrb) #nope
+
+rab6_feat_plot <- FeaturePlot(oculina_named_h, features = c("RAB6"), split.by = "condition") #nah, could be higher in apo but not convincing
+
+
+#in apoptosis group
+cryab_feat_plot <- FeaturePlot(oculina_named_h, features = c("CRYAB"), split.by = "condition") #nope
+
+lgmn_feat_plot <- FeaturePlot(oculina_named_h, features = c("LGMN"), max.cutoff = 10, order=TRUE, split.by = "condition")
+#saved both together and split by condition as lgmn_feat_plot_012624 and lgmn_feat_plot_012624_condition as landscape 6x4 and 8x3.7
+VlnPlot(object =oculina_named_h, features = c("LGMN"), pt.size= 0,combine = F,assay = "RNA", split.by = "condition", cols=c("gray40", "#CC6600"))
+#saved as lgmn_vln_plot_012624_condition
+
+pdxk_feat_plot <- FeaturePlot(oculina_named_h, features = c("PDXK"), order=TRUE) #nah
+
+psmg2_feat_plot <- FeaturePlot(oculina_named_h, features = c("PSMG2"), order=TRUE, split.by = "condition") #dispersed across cell types 
+
+#in oxidative stress group
+plod1_feat_plot <- FeaturePlot(oculina_named_h, features = c("PLOD1"), order=TRUE) #nah
+
+pdia4_feat_plot <- FeaturePlot(oculina_named_h, features = c("PDIA4"), order=TRUE, max.cutoff = 5) 
+#i guess save this one; this one is not specific to a cell type but more broadly expressed across cell types; could argue that in apo there's higher expression across all cell types while in sym its mostly in gderm
+#pdia4_feat_plot_012624_condition 7x4
+#pdia4_feat_plot_012624 as 6x4
+VlnPlot(object =oculina_named_h, features = c("PDIA4"), pt.size= 0,combine = F,assay = "RNA", split.by = "condition", cols=c("gray40", "#CC6600"))
+#saved as pdia4_vln_plot_012624_condition
+
+catl_feat_plot <- FeaturePlot(oculina_named_h, features = c("CATL","CATL.1","CATL.2","CATL.3","CATL.4","CATL.6","CATL.7","CATL.8","CATL.9"), order=TRUE, split.by = "condition")
+#catl_feat_plot_012624 10x8 landscape
+#catl_feat_plot_012624_condition 20x10 portrait
+VlnPlot(object =oculina_named_h, features = c("CATL","CATL.1","CATL.2","CATL.3","CATL.4","CATL.6","CATL.7","CATL.8","CATL.9"), pt.size= 0,combine = F,assay = "RNA", split.by = "condition", cols=c("gray40", "#CC6600"))
+#saved as catl.1_vln_plot_012624_condition
+#saved as catl.9_vln_plot_012624_condition
+
+pyg_feat_plot <- FeaturePlot(oculina_named_h, features = c("PYG"), order=TRUE, split.by = "condition") #dispersed signal, not very different
+```
+
+now look at immune signals identified through hanny's
+```{r}
+#tlr2
+tlr2_feat_plot <- FeaturePlot(oculina_named_h, features = c("TLR2.3","TLR2.6"), order=TRUE)
+#meh
+
+#try tenascin
+tenr_feat_plot <- FeaturePlot(oculina_named_h, features = c("TENR","TENR.11","TENR.18"), order=TRUE, split.by = "condition")
+#specific expression in gland but still pretty low
+```
+
+look at glutamine production and sugar/lipid transport from Hanny's paper
+```{r}
+#glutamine production
+#glsn glutamate synthase
+glsn_feat_plot <- FeaturePlot(oculina_named_h, features = c("GLSN"), order=TRUE, max.cutoff = 15, split.by = "condition")
+#saved as saved as glsn_feat_plot_012624 5x4
+#saved as glsn_feat_plot_012624_condition 10x4
+VlnPlot(object =oculina_named_h, features = c("GLSN"), pt.size= 0,combine = F,assay = "RNA", split.by = "condition", cols=c("gray40", "#CC6600"))
+#saved as glsn_vln_plot_012624_condition
+
+#Glutathione-specific gamma-glutamylcyclotransferase 1 and 2 (CHAC1 and CHAC2)
+chac_feat_plot <- FeaturePlot(oculina_named_h, features = c("CHAC1","CHAC2"), order=TRUE, split.by = "condition")
+VlnPlot(object =oculina_named_h, features = c("CHAC1", "CHAC2"), pt.size= 0,combine = F,assay = "RNA", split.by = "condition", cols=c("gray40", "#CC6600")) #nah not very high expression and only in few cells
+
+#glutamine synthetase
+glna_feat_plot <- FeaturePlot(oculina_named_h, features = c("GLNA","GLNA.1"), order=TRUE, split.by = "condition")
+#saved as glna_feat_plot_012624 10x4
+#saved as glna_feat_plot_012624_condition as 10x8
+VlnPlot(object =oculina_named_h, features = c("GLNA", "GLNA.1"), pt.size= 0,combine = F,assay = "RNA", split.by = "condition", cols=c("gray40", "#CC6600"))#not as good, tho glna.1 higher in gderm4a
+
+#dhe glutamate dehydrogenase
+dhe_feat_plot <- FeaturePlot(oculina_named_h, features = c("DHE3","DHE3.1","DHE4","DHE4.1"), order=TRUE, split.by = "condition")
+#saved as dhe_feat_plot_012624 as 10x8
+#saved as dhe_feat_plot_012624_condition 12x10 portrait
+#the ones that are specific to gastroderm are in sym; the ones that are diffuse are in both
+VlnPlot(object =oculina_named_h, features = c("DHE4"), pt.size= 0,combine = F,assay = "RNA", split.by = "condition", cols=c("gray40", "#CC6600"))
+#only DHE4 is descriptive when in this format so just saving that one
+#saved as dhe4_vln_plot_012623_condition
+
+#Folylpolyglutamate synthase, mitochondrial FOLC
+folc_feat_plot <- FeaturePlot(oculina_named_h, features = c("FOLC"), order=TRUE, split.by = "condition") #nah
+
+##now sugar/lipid transport
+#apolipophorin
+aplp_feat_plot <- FeaturePlot(oculina_named_h, features = c("APLP"), order=TRUE, max.cutoff = 100, split.by = "condition")
+VlnPlot(object =oculina_named_h, features = c("APLP"), pt.size= 0,combine = F,assay = "RNA", split.by = "condition", cols=c("gray40", "#CC6600"))
+#saved as aplp_feat_plot_012624 as 5x4
+#saved as aplp_feat_plot_012624_condition as 10x4
+#saved as aplp_vln_plot_012624_condition
+
+apoB_feat_plot <- FeaturePlot(oculina_named_h, features = c("APOB"), order=TRUE, max.cutoff = 12, split.by = "condition")
+VlnPlot(object =oculina_named_h, features = c("APOB"), pt.size= 0,combine = F,assay = "RNA", split.by = "condition", cols=c("gray40", "#CC6600"))
+#saved as apoB_feat_plot_012624 as 5x4
+#saved as apoB_feat_plot_012624_condition as 10x4
+#saved as apoB_vln_plot_012624_condition
+
+apoB1_feat_plot <- FeaturePlot(oculina_named_h, features = c("APOB.1"), order=TRUE, max.cutoff = 40, split.by = "condition")
+VlnPlot(object =oculina_named_h, features = c("APOB.1"), pt.size= 0,combine = F,assay = "RNA", split.by = "condition", cols=c("gray40", "#CC6600"))
+#saved as apoB1_feat_plot_012624 as 5x4
+#apoB1_feat_plot_012624_condition as 10x4
+#apoB1_vln_plot_012624_condition
+
+#solute carrier glucose transporter GTR
+gtr_feat_plot <- FeaturePlot(oculina_named_h, features = c("GTR8.3"), order=TRUE, split.by = "condition") #let's just do 8.3 bc its the strongest signal but the others could be explored
+#saved as gtr8.3_feat_plot_012624 as 5x4
+#saved as gtr8.3_feat_plot_012624_condition as 10x4
+VlnPlot(object =oculina_named_h, features = c("GTR8.3"), pt.size= 0,combine = F,assay = "RNA", split.by = "condition", cols=c("gray40", "#CC6600"))
+#not saving this one, not very good
+```
+
+
+###Subsetting and reclustering cell types of interest
+
+#Immune Cell
+subset to immune cell cluster
+```{r}
+immune <- subset(oculina_named_h, idents = "Immune Cell") 
+
+#immune_1 <- SCTransform(immune) I don't think this is necessary bc this is a normalization within each cell and I already did it at the beginning
+immune_1 <- FindVariableFeatures(immune, selection.method = "vst")
+immune_1 <- ScaleData(immune_1, verbose = FALSE, assay="RNA")
+immune_1 <- RunPCA(immune_1)
+immune_1 <- RunUMAP(immune_1, reduction="pca", dims=1:30, return.model=TRUE)
+immune_1 <- FindNeighbors(immune_1, reduction ="pca", dims=1:30)
+
+immune_1 <- FindClusters(immune_1, resolution = 0.25)
+
+immune_1@meta.data$seurat_clusters <- as.numeric(as.character(immune_1@meta.data$seurat_clusters))+1
+Idents(immune_1)<- "seurat_clusters"
+immune_1$seurat_clusters
+immune_1@active.ident <- factor(x = immune_1@active.ident, levels = 1:2)
+immune_1@active.ident
+
+plot3 <- DimPlot(immune_1, reduction = "umap", label = T, cols=alpha(c("#FF9900", "#33CC99"), 0.75))
+#two clusters
+
+plot4 <- DimPlot(immune_1, reduction = "umap", label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + ggtitle("") + theme(legend.text=element_text(size=10))
+
+#saved as umap_immune_plot3plot4
+#and as umap_immune_plot4 5x4
+```
+
+Look at the PC effect on split by symstate
+```{r}
+immune_topfeat <- TopFeatures(object = immune_1[["pca"]], dim = 1, nfeatures = 20, balanced = TRUE)
+immune_1[["umap"]]@cell.embeddings
+##https://hbctraining.github.io/scRNA-seq_online/lessons/08_SC_clustering_quality_control.html
+columns <- c(paste0("PC_", 1:10),
+            "ident",
+            "UMAP_1", "UMAP_2")
+pc_data_im1 <- FetchData(immune_1, 
+                     vars = columns)
+# Adding cluster label to center of cluster on UMAP
+umap_label_im1 <- FetchData(immune_1, 
+  vars = c("ident", "UMAP_1", "UMAP_2"))  %>%
+  group_by(ident) %>%
+  summarise(x=mean(UMAP_1), y=mean(UMAP_2))
+# Plotting a UMAP plot for each of the PCs
+
+map(paste0("PC_", 1:10), function(pc){
+        ggplot(pc_data_im1, 
+               aes(UMAP_1, UMAP_2)) +
+                geom_point(aes_string(color=pc), 
+                           alpha = 0.7) +
+                scale_color_gradient(guide = FALSE, 
+                                     low = "grey90", 
+                                     high = "blue")  +
+                geom_text(data=umap_label_im1, 
+                          aes(label=ident, x, y)) +
+                ggtitle(pc)
+}) %>% 
+        plot_grid(plotlist = .)
+#saved as immune_pcplots_umap_110723
+
+DimPlot(immune_1, reduction = "pca", label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5))
+DimPlot(immune_1, reduction = "pca", dims = c(3, 4), label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5))
+### in the first 10 PCs, not splitting visibly by sym state (may be underpowered bc few cells)
+
+install_github("pmartinezarbizu/pairwiseAdonis/pairwiseAdonis")
+library(pairwiseAdonis)
+
+stdev_immune <- Stdev(immune_1, reduction = "pca")
+
+pca_im1 <- pc_data_im1
+pca_im1$sym_state <- immune_1@meta.data$condition
+summary(aov(PC_1 ~ sym_state, data = pca_im1)) #0.0309 *
+summary(aov(PC_2 ~ sym_state, data = pca_im1)) #0.782
+summary(aov(PC_3 ~ sym_state, data = pca_im1)) #0.463
+summary(aov(PC_4 ~ sym_state, data = pca_im1)) #0.463
+summary(aov(PC_5 ~ sym_state, data = pca_im1)) #0.0683 .                               
+summary(aov(PC_6 ~ sym_state, data = pca_im1)) #0.919
+summary(aov(PC_7 ~ sym_state, data = pca_im1)) #0.21
+summary(aov(PC_8 ~ sym_state, data = pca_im1)) #0.967
+summary(aov(PC_9 ~ sym_state, data = pca_im1)) #0.727
+summary(aov(PC_10 ~ sym_state, data = pca_im1)) #0.203
+
+#1 and 5 are weekly sig
+adonis2(pca_im1[,c(1,5)] ~ sym_state, data = pca_im1[c(1,5,14)], method='eu', na.rm = TRUE)
+#           Df SumOfSqs      R2     F Pr(>F)   
+#sym_state   1   1018.1 0.03963 4.333  0.006 **
+#Residual  105  24671.5 0.96037                
+#Total     106  25689.7 1.00000   
+
+li_imm <- stdev_immune^2 / sum(stdev_immune^2)
+pc1v_imm <- round(li_imm[1] * 100, 1) #9.3 of variance
+pc5v_imm <- round(li_imm[5] * 100, 1) #4.4 of variance
+
+imm_pc1.5 <- DimPlot(immune_1, reduction = "pca", dims = c(1, 5), label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + xlab(paste0("PC1: ",pc1v_imm,"% variance")) + ylab(paste0("PC5: ", pc5v_imm, "% variance"))
+#saved as immune_pc1_pc5_012724 with 5x4.5 dims
+
+print(immune_1[["pca"]], dims = 1:5, nfeatures = 10)
+#PC_ 1 
+#Positive:  RL371, RLA2, DDX5, RLA1, RS5, PLBL2.1, EF1A, RS12, HYDMA, PABP4 
+#Negative:  EVM.20prediction.20chromosome.13.2337, CO7A1.2, EVM.20prediction.20chromosome.13.2334, EVM.20prediction.20chromosome.4.2062, EVM.20prediction.20chromosome.12.3431, EVM.20prediction.20chromosome.7.2823, EVM.20prediction.20chromosome.6.359, FBCD1.15, EVM.20prediction.20chromosome.14.6095, EVM.20prediction.20chromosome.13.3991 
+#PC_ 5 
+#Positive:  EVM.20prediction.20chromosome.11.2843, SYCP3, DHRS7.3, TICRR, TIM, GLSN, EVM.20prediction.20chromosome.14.6563, BCDO1.1, MEGF6.2, ADK 
+#Negative:  KMT5A, HCD2.1, ERP29, MSHA.21, VATL, EVM.20prediction.20chromosome.4.377, H2B.10, ADK.1, NUP58, RUXF
+
+DefaultAssay(immune_1) <- "RNA"
+immune_1[["RNA"]]@counts<-as.matrix(immune_1[["RNA"]]@counts)+1
+
+#this to look at apo vs sym differentially expressed genes
+immune_mark <- FindMarkers(immune_1, ident.1 = "sym", ident.2="apo", group.by = "condition", test.use="DESeq2", slot = "counts")
+head(immune_mark)
+#pretty sure in this case neg lfc means down in sym; pos lfc means up in sym
+immune_mark <- rownames_to_column(immune_mark, var="gene_symbol")
+
+immune_pc1_feat <- c("RL371", "RLA2", "DDX5", "RLA1", "RS5", "PLBL2.1", "EF1A", "RS12", "HYDMA", "PABP4", "EVM.20prediction.20chromosome.13.2337", "CO7A1.2", "EVM.20prediction.20chromosome.13.2334", "EVM.20prediction.20chromosome.4.2062", "EVM.20prediction.20chromosome.12.3431", "EVM.20prediction.20chromosome.7.2823", "EVM.20prediction.20chromosome.6.359", "FBCD1.15", "EVM.20prediction.20chromosome.14.6095", "EVM.20prediction.20chromosome.13.3991")
+
+immune_pc5_feat <- c("EVM.20prediction.20chromosome.11.2843", "SYCP3", "DHRS7.3", "TICRR", "TIM", "GLSN", "EVM.20prediction.20chromosome.14.6563", "BCDO1.1", "MEGF6.2", "ADK", "KMT5A", "HCD2.1", "ERP29", "MSHA.21", "VATL", "EVM.20prediction.20chromosome.4.377", "H2B.10", "ADK.1", "NUP58", "RUXF")
+
+#visualize the pc1 features in barplot
+immune_pc1_mark <- subset(immune_mark, gene_symbol %in% immune_pc1_feat)
+# add a column of NAs
+immune_pc1_mark$diffexpressed <- "ns"
+# if log2Foldchange > 0 set as "SYM"
+immune_pc1_mark$diffexpressed[immune_pc1_mark$avg_log2FC > 0] <- "SYM"
+# if log2Foldchange < 0 set as "APO"
+immune_pc1_mark$diffexpressed[immune_pc1_mark$avg_log2FC < 0] <- "APO"
+
+immune_pc1_bar <- ggplot(data=immune_pc1_mark, aes(y=gene_symbol, x=avg_log2FC, fill=diffexpressed)) +
+  geom_bar(position="stack", stat="identity", color="black", alpha=0.6)+
+  scale_fill_manual(values=c("gray40", "#CC6600"))+
+  theme_classic()
+##saved as immune_pc1_barplot as landscape 8x5
+
+#visualize the pc5 features in barplot
+immune_pc5_mark <- subset(immune_mark, gene_symbol %in% immune_pc5_feat)
+# add a column of NAs
+immune_pc5_mark$diffexpressed <- "ns"
+# if log2Foldchange > 0 set as "SYM"
+immune_pc5_mark$diffexpressed[immune_pc5_mark$avg_log2FC > 0] <- "SYM"
+# if log2Foldchange < 0 set as "APO"
+immune_pc5_mark$diffexpressed[immune_pc5_mark$avg_log2FC < 0] <- "APO"
+immune_pc5_bar <- ggplot(data=immune_pc5_mark, aes(y=gene_symbol, x=avg_log2FC, fill=diffexpressed)) +
+  geom_bar(position="stack", stat="identity", color="black", alpha=0.6)+
+  scale_fill_manual(values=c("gray40", "#CC6600"))+
+  theme_classic()
+##saved as immune_pc5_barplot as 8x5 landscape
+```
+
+Look at marker genes btwn the subclusters
+```{r}
+#this to look at marker genes between the subclusters
+immune_markers_subclust <- FindAllMarkers(immune_1, 
+                          min.pct = -Inf, 
+                          logfc.threshold = .5, 
+                          only.pos = T, 
+                          test.use = "MAST",
+                          latent.vars = c('percent.mt', 'nFeature_RNA'))
+
+immune_markers_subclust
+```
+
+Matt Kanke says: "I wouldn't further subcluster the subcluster, especially as you don't have many cells in each cluster as is. It could be that these are different immune cells or different cell states of the same immune cell."
+```{r}
+#immune_1@active.ident
+#i0 <- subset(immune_1, idents = "0")
+#i0 <- FindVariableFeatures(i0, selection.method = "vst")
+#i0 <- ScaleData(i0, verbose = FALSE, assay="RNA")
+#i0 <- RunPCA(i0)
+#i0 <- RunUMAP(i0, reduction="pca", dims=1:30, return.model=TRUE)
+#i0 <- FindNeighbors(i0, reduction ="pca", dims=1:30)
+#i0 <- FindClusters(i0, resolution = 0.05)
+
+#i0@active.ident
+#DefaultAssay(i0) <- "RNA"
+#i0[["RNA"]]@counts<-as.matrix(i0[["RNA"]]@counts)+1
+```
+
+#Gastrodermis 1
+```{r}
+gastrodermis1 <- subset(oculina_named_h, idents = "Gastrodermis 1") 
+
+#immune_1 <- SCTransform(immune) I don't think this is necessary bc this is a normalization within each cell and I already did it at the beginning
+gderm_1 <- FindVariableFeatures(gastrodermis1, selection.method = "vst")
+gderm_1 <- ScaleData(gderm_1, verbose = FALSE, assay="RNA")
+gderm_1 <- RunPCA(gderm_1)
+gderm_1 <- RunUMAP(gderm_1, reduction="pca", dims=1:30, return.model=TRUE)
+gderm_1 <- FindNeighbors(gderm_1, reduction ="pca", dims=1:30)
+
+gderm_1 <- FindClusters(gderm_1, resolution = 0.25)
+#3!
+
+gderm_1@meta.data$seurat_clusters <- as.numeric(as.character(gderm_1@meta.data$seurat_clusters))+1
+Idents(gderm_1)<- "seurat_clusters"
+gderm_1$seurat_clusters
+gderm_1@active.ident <- factor(x = gderm_1@active.ident, levels = 1:3)
+gderm_1@active.ident
+
+plot5 <- DimPlot(gderm_1, reduction = "umap", label = T)
+plot5b <- DimPlot(gderm_1, reduction = "umap", label = T, cols=alpha(c("#FF9900", "#33CC99", "#3333FF"), 0.5))
+
+plot6 <- DimPlot(gderm_1, reduction = "umap", label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + ggtitle("") + theme(legend.text=element_text(size=10))
+#umap_gderm1_plot5plot6 8x4 landscape
+
+plot6b <- DimPlot(gderm_1, reduction = "umap", label=F, order=c("sym", "apo"), split.by = "condition", cols=alpha(c("#FF9900", "#33CC99", "#3333FF"), 0.5)) + ggtitle("") + theme(legend.text=element_text(size=10))
+#umap_gderm1_plot6b 10x4 landscape
+```
+
+```{r}
+gderm1_topfeat <- TopFeatures(object = gderm_1[["pca"]], dim = 1, nfeatures = 20, balanced = TRUE)
+gderm_1[["umap"]]@cell.embeddings
+##https://hbctraining.github.io/scRNA-seq_online/lessons/08_SC_clustering_quality_control.html
+columns <- c(paste0("PC_", 1:10),
+            "ident",
+            "UMAP_1", "UMAP_2")
+pc_data_gd1 <- FetchData(gderm_1, 
+                     vars = columns)
+# Adding cluster label to center of cluster on UMAP
+umap_label_gd1 <- FetchData(gderm_1, 
+  vars = c("ident", "UMAP_1", "UMAP_2"))  %>%
+  group_by(ident) %>%
+  summarise(x=mean(UMAP_1), y=mean(UMAP_2))
+# Plotting a UMAP plot for each of the PCs
+
+map(paste0("PC_", 1:10), function(pc){
+        ggplot(pc_data_gd1, 
+               aes(UMAP_1, UMAP_2)) +
+                geom_point(aes_string(color=pc), 
+                           alpha = 0.7) +
+                scale_color_gradient(guide = FALSE, 
+                                     low = "grey90", 
+                                     high = "blue")  +
+                geom_text(data=umap_label_gd1, 
+                          aes(label=ident, x, y)) +
+                ggtitle(pc)
+}) %>% 
+        plot_grid(plotlist = .)
+#saved as gderm1_pcplots_umap_092023
+
+DimPlot(gderm_1, reduction = "pca", label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5))
+DimPlot(gderm_1, reduction = "pca", dims = c(3, 4), label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5))
+
+stdev_gderm1 <- Stdev(gderm_1, reduction = "pca")
+
+pca_gd1 <- pc_data_gd1
+pca_gd1$sym_state <- gderm_1@meta.data$condition
+summary(aov(PC_1 ~ sym_state, data = pca_gd1)) #<2e-16 ***
+summary(aov(PC_2 ~ sym_state, data = pca_gd1)) #0.000329 ***
+summary(aov(PC_3 ~ sym_state, data = pca_gd1)) #0.00718 **
+summary(aov(PC_4 ~ sym_state, data = pca_gd1)) #7.6e-13 ***
+summary(aov(PC_5 ~ sym_state, data = pca_gd1)) #<2e-16 ***                               
+summary(aov(PC_6 ~ sym_state, data = pca_gd1)) #5.84e-05 ***
+summary(aov(PC_7 ~ sym_state, data = pca_gd1)) #2.32e-11 ***
+summary(aov(PC_8 ~ sym_state, data = pca_gd1)) #2.07e-15 ***
+summary(aov(PC_9 ~ sym_state, data = pca_gd1)) #7.97e-05 ***
+summary(aov(PC_10 ~ sym_state, data = pca_gd1)) #8.96e-07 ***
+
+#1 and 5 are the best
+adonis2(pca_gd1[,c(1,5)] ~ sym_state, data = pca_gd1[c(1,5,14)], method='eu', na.rm = TRUE)
+#           Df SumOfSqs      R2     F Pr(>F)   
+#sym_state    1     6595 0.09236 123.02  0.001 ***
+#Residual  1209    64813 0.90764                  
+#Total     1210    71408 1.00000         
+
+li_gd1 <- stdev_gderm1^2 / sum(stdev_gderm1^2)
+pc1v_gd1 <- round(li_gd1[1] * 100, 1) #13.3 of variance
+pc5v_gd1 <- round(li_gd1[5] * 100, 1) #3.7 of variance
+
+gd1_pc1.5 <- DimPlot(gderm_1, reduction = "pca", dims = c(1, 5), label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + xlab(paste0("PC1: ",pc1v_gd1,"% variance")) + ylab(paste0("PC5: ", pc5v_gd1, "% variance"))
+#saved as gderm1_pc1_pc5_110923 with 5x4.5 dims
+
+print(gderm_1[["pca"]], dims = 1:5, nfeatures = 10)
+#PC_ 1 
+#Positive:  RS27, EVM.20prediction.20chromosome.4.1613, EVM.20prediction.20chromosome.1.1030, RL34, HEBP2.2, SAHH, TYB.1, C163A.4, EPDR1.1, EVM.20prediction.20chromosome.7.259 
+#Negative:  USOM5.30, EVM.20prediction.20chromosome.10.1343, MLP.10, EVM.20prediction.20chromosome.14.6115, ZSWM8.2, FCN1.12, EVM.20prediction.20chromosome.7.472, EVM.20prediction.20chromosome.14.6117, MUSK.7, EVM.20prediction.20chromosome.14.6116 
+#PC_ 5 
+#Positive:  MLP2, CALM.20, MYS.2, TPM.5, PAX7, RBP2A.2, TPM1, ACTC.7, SQH.1, NCAM1.3 
+#Negative:  CATL.9, CATL.6, H90A1, CATZ, GLYM, PEAM1, NUCL, SERA.1, GRP78, ASPP 
+
+DefaultAssay(gderm_1) <- "RNA"
+gderm_1[["RNA"]]@counts<-as.matrix(gderm_1[["RNA"]]@counts)+1
+
+gderm1_mark <- FindMarkers(gderm_1, ident.1 = "sym", ident.2="apo", group.by = "condition", test.use="DESeq2", slot = "counts")
+head(gderm1_mark)
+#pretty sure in this case neg lfc means down in sym; pos lfc means up in sym
+gderm1_mark <- rownames_to_column(gderm1_mark, var="gene_symbol")
+
+gderm1_pc1_feat <- c("RS27", "EVM.20prediction.20chromosome.4.1613", "EVM.20prediction.20chromosome.1.1030", "RL34", "HEBP2.2", "SAHH", "TYB.1", "C163A.4", "EPDR1.1", "EVM.20prediction.20chromosome.7.259", "USOM5.30", "EVM.20prediction.20chromosome.10.1343", "MLP.10", "EVM.20prediction.20chromosome.14.6115", "ZSWM8.2", "FCN1.12", "EVM.20prediction.20chromosome.7.472", "EVM.20prediction.20chromosome.14.6117", "MUSK.7", "EVM.20prediction.20chromosome.14.6116")
+
+gderm1_pc5_feat <- c("MLP2", "CALM.20", "MYS.2", "TPM.5", "PAX7", "RBP2A.2", "TPM1", "ACTC.7", "SQH.1", "NCAM1.3", "CATL.9", "CATL.6", "H90A1", "CATZ", "GLYM", "PEAM1", "NUCL", "SERA.1", "GRP78", "ASPP")
+
+#visualize the pc1 features in barplot
+gderm1_pc1_mark <- subset(gderm1_mark, gene_symbol %in% gderm1_pc1_feat)
+# add a column of NAs
+gderm1_pc1_mark$diffexpressed <- "ns"
+# if log2Foldchange > 0 set as "SYM"
+gderm1_pc1_mark$diffexpressed[gderm1_pc1_mark$avg_log2FC > 0] <- "SYM"
+# if log2Foldchange < 0 set as "APO"
+gderm1_pc1_mark$diffexpressed[gderm1_pc1_mark$avg_log2FC < 0] <- "APO"
+
+gderm1_pc1_bar <- ggplot(data=gderm1_pc1_mark, aes(y=gene_symbol, x=avg_log2FC, fill=diffexpressed)) +
+  geom_bar(position="stack", stat="identity", color="black", alpha=0.6)+
+  scale_fill_manual(values=c("gray40", "#CC6600"))+
+  theme_classic()
+##saved as gderm1_pc1_barplot as landscape 8x5
+
+#visualize the pc5 features in barplot
+gderm1_pc5_mark <- subset(gderm1_mark, gene_symbol %in% gderm1_pc5_feat)
+# add a column of NAs
+gderm1_pc5_mark$diffexpressed <- "ns"
+# if log2Foldchange > 0 set as "SYM"
+gderm1_pc5_mark$diffexpressed[gderm1_pc5_mark$avg_log2FC > 0] <- "SYM"
+# if log2Foldchange < 0 set as "APO"
+gderm1_pc5_mark$diffexpressed[gderm1_pc5_mark$avg_log2FC < 0] <- "APO"
+gderm1_pc5_bar <- ggplot(data=gderm1_pc5_mark, aes(y=gene_symbol, x=avg_log2FC, fill=diffexpressed)) +
+  geom_bar(position="stack", stat="identity", color="black", alpha=0.6)+
+  scale_fill_manual(values=c("gray40", "#CC6600"))+
+  theme_classic()
+##saved as gderm1_pc5_barplot as 8x5 landscape
+```
+
+Look at subcluster marker genes
+```{r}
+gderm1_markers_subclust <- FindAllMarkers(gderm_1, 
+                          min.pct = -Inf, 
+                          logfc.threshold = .5, 
+                          only.pos = T, 
+                          test.use = "MAST",
+                          latent.vars = c('percent.mt', 'nFeature_RNA'))
+
+gderm1_markers_subclust
+#subclust 1 and 2 have both apo and sym but they're not overlapping
+#subclust 3 is like 99% sym
+#2 doesn't have any marker genes
+#1 has lots of ribosomal protein genes
+#i'll probably do some directed fishing of genes involved in symbiont stuff
+
+percent_cluster_gderm1 <- prop.table(table(Idents(gderm_1), gderm_1@meta.data$condition), margin = 2)
+
+prop_cluster_gderm1 <- as.data.frame(percent_cluster_gderm1) %>%
+  mutate(Cluster = Var1,
+         Condition = Var2) %>%
+  ggplot(., aes(Cluster, Freq, fill = Condition)) +
+  geom_bar(stat = 'identity', position = 'dodge', color="black", width=0.6) +
+  scale_fill_manual(values=alpha(c("gray40", "#CC6600"), 0.75))+
+  ylab("Proportion of Cells per Library")+
+  coord_flip()+
+  theme(panel.background = element_rect(color="black", fill="white"),
+        panel.grid.major = element_line(colour = "gray80", linewidth = 0.5, linetype="dotted"))
+#prop_cluster_gderm1
+
+
+#get apo vs sym differences for subcluster 1 of gderm1
+gderm1_1 <- subset(gderm_1, idents="1")
+DefaultAssay(gderm1_1) <- "RNA"
+
+gderm1_1_mark <- FindMarkers(gderm1_1, ident.1 = "sym", ident.2="apo", group.by = "condition", test.use="DESeq2", slot = "counts")
+head(gderm1_1_mark)
+
+gderm1_1_mark <- rownames_to_column(gderm1_1_mark, var="gene_symbol")
+
+#get apo vs sym differences for subcluster 2 of gderm1
+gderm1_2 <- subset(gderm_1, idents="2")
+DefaultAssay(gderm1_2) <- "RNA"
+
+gderm1_2_mark <- FindMarkers(gderm1_2, ident.1 = "sym", ident.2="apo", group.by = "condition", test.use="DESeq2", slot = "counts")
+head(gderm1_2_mark)
+gderm1_2_mark <- rownames_to_column(gderm1_2_mark, var="gene_symbol")
+
+#and for 3
+gderm1_3 <- subset(gderm_1, idents="3")
+DefaultAssay(gderm1_3) <- "RNA"
+
+gderm1_3_mark <- FindMarkers(gderm1_3, ident.1 = "sym", ident.2="apo", group.by = "condition", test.use="DESeq2", slot = "counts")
+head(gderm1_3_mark)
+gderm1_3_mark <- rownames_to_column(gderm1_3_mark, var="gene_symbol")
+```
+
+Top10 pos and neg features driving pcs1-5 with annotated gene names
+```{r}
+print(gderm_1[["pca"]], dims = 1:5, nfeatures = 10)
+
+gderm1_feats_1to5 <- c("RS27", "RL34", "HEBP2.2", "SAHH", "TYB.1", "C163A.4", "EPDR1.1", "USOM5.30", "MLP.10", "ZSWM8.2", "FCN1.12", "MUSK.7", "CRA1B.3", "CO4A1.4", "RBP2A.2", "COA", "TPM2", "CO4A1.2", "CO1A2.12", "FLNA.2", "THYG.1", "CO1A2.9", "ACOD.2", "ACOT5", "ACBG2", "GLCM.1", "DHE4", "S2611", "PGFS.2", "HMCN1.81", "C163A.4", "WNT7B.2", "HMCN2.32", "ADAM9.1", "TEKT2", "ZC21C", "ANK2.5", "CFA45", "ENKUR", "CC173", "CC146", "CFA53", "VWA3A.2", "GAS8", "FLNA.2", "CO4A1.2", "PRG4", "TITIN", "RBP2A.2", "MYS.2", "SMC5", "MACF1", "MCM3", "MCM4", "HMCN1.81", "ZC21C", "ENKUR", "CFA53", "HMCN2.32", "TEKT2", "MLP2", "CALM.20", "MYS.2", "TPM.5", "PAX7", "RBP2A.2", "TPM1", "ACTC.7", "SQH.1", "NCAM1.3", "CATL.9", "CATL.6", "H90A1", "CATZ", "GLYM", "PEAM1", "NUCL", "SERA.1", "GRP78", "ASPP")
+
+gderm1_1to5_mark <- subset(gderm1_mark, gene_symbol %in% gderm1_feats_1to5)
+# add a column of NAs
+gderm1_1to5_mark$diffexpressed <- "ns"
+# if log2Foldchange > 0 set as "SYM"
+gderm1_1to5_mark$diffexpressed[gderm1_1to5_mark$avg_log2FC > 0] <- "SYM"
+# if log2Foldchange < 0 set as "APO"
+gderm1_1to5_mark$diffexpressed[gderm1_1to5_mark$avg_log2FC < 0] <- "APO"
+gderm1_1to5_bar <- ggplot(data=gderm1_1to5_mark, aes(y=gene_symbol, x=avg_log2FC, fill=diffexpressed)) +
+  geom_bar(position="stack", stat="identity", color="black", alpha=0.6)+
+  scale_fill_manual(values=c("gray40", "#CC6600"))+
+  theme_classic()
+#saved as gderm1_1to5_bar as portrait 9x4
+
+#gderm1_1to5_lfc <- as.data.frame(gderm1_feats_1to5)
+#colnames(gderm1_1to5_lfc)=paste(c("gene_symbol"))
+
+#gderm1_1to5_lfc <- gderm1_1to5_lfc %>%
+  #left_join(gderm1_mark) %>%
+  #distinct(gene_symbol, .keep_all = TRUE)
+
+#avg_g1 <- AverageExpression(gderm_1, group.by = "condition", features = gderm1_feats_1to5, assays = "RNA")
+#head(avg_g1)
+#avg_g1 <- as.data.frame(avg_g1)
+#avg_g1 <- rownames_to_column(avg_g1, "gene_symbol")
+#colnames(avg_g1)=paste(c("gene_symbol","apo","sym"))
+#avg_g1_1to5 <- avg_g1 %>%
+  #right_join(gderm1_1to5_lfc) %>%
+  #dplyr::select(gene_symbol, apo, sym) %>%
+  #column_to_rownames(var = "gene_symbol")
+
+#agg_g1 <- AggregateExpression(gderm_1, assays="RNA", group.by = "condition", normalization.method = "LogNormalize", scale.factor = 10000, features=gderm1_feats_1to5)
+
+
+#avg_g1_1to5_means = apply(avg_g1_1to5, 1, mean)
+#explc_avg_g1_1to5 = avg_g1_1to5-avg_g1_1to5_means
+
+#hm_avg_g1 <- pheatmap(as.matrix(explc_avg_g1_1to5), color=rev(colorRampPalette(brewer.pal(n=11, name="RdBu"))(20)), cluster_rows = F, show_rownames = T, fontsize_row=8, fontsize_col=10, cluster_cols = F, show_colnames = T, angle_col= "315", cellheight = 8, cellwidth = 14, scale="none", legend=T)
+
+#color<-colorRampPalette(brewer.pal(n=9, name="Reds"),bias=0.5)(100)
+
+#hm_avg_g1 <- DoHeatmap(avg_g1, features = gderm1_1to5_lfc$gene_symbol,label=T, assay="RNA",  group.colors = c("gray40", "#CC6600"), draw.lines = FALSE, group.by = "active.ident") + theme(axis.text.y= element_text(size=0)) + scale_fill_gradientn(colors=color)
+```
+
+
+#Gastrodermis 2
+```{r}
+gastrodermis2 <- subset(oculina_named_h, idents = "Gastrodermis 2") 
+
+gderm_2 <- FindVariableFeatures(gastrodermis2, selection.method = "vst")
+gderm_2 <- ScaleData(gderm_2, verbose = FALSE, assay="RNA")
+gderm_2 <- RunPCA(gderm_2)
+gderm_2 <- RunUMAP(gderm_2, reduction="pca", dims=1:30, return.model=TRUE)
+gderm_2 <- FindNeighbors(gderm_2, reduction ="pca", dims=1:30)
+
+gderm_2 <- FindClusters(gderm_2, resolution = 0.25)
+#3
+
+gderm_2@meta.data$seurat_clusters <- as.numeric(as.character(gderm_2@meta.data$seurat_clusters))+1
+Idents(gderm_2)<- "seurat_clusters"
+gderm_2$seurat_clusters
+gderm_2@active.ident <- factor(x = gderm_2@active.ident, levels = 1:3)
+gderm_2@active.ident
+
+plot7 <- DimPlot(gderm_2, reduction = "umap", label = T)
+plot7b <- DimPlot(gderm_2, reduction = "umap", label = T, cols=alpha(c("#FF9900", "#33CC99", "#3333FF"), 0.5))
+
+plot8 <- DimPlot(gderm_2, reduction = "umap", label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + ggtitle("") + theme(legend.text=element_text(size=10))
+#subscluster 3 is basically all sym tho so that is interesting >:)
+
+#umap_gderm2_plot7plot8 8x4
+
+plot8b <- DimPlot(gderm_2, reduction = "umap", label=F, order=c("sym", "apo"), split.by = "condition", cols=alpha(c("#FF9900", "#33CC99", "#3333FF"), 0.5)) + ggtitle("") + theme(legend.text=element_text(size=10))
+#umap_gderm2_plot8b 8x4 landscape
+```
+
+
+```{r}
+gderm2_topfeat <- TopFeatures(object = gderm_2[["pca"]], dim = 1, nfeatures = 20, balanced = TRUE)
+gderm_2[["umap"]]@cell.embeddings
+columns <- c(paste0("PC_", 1:10),
+            "ident",
+            "UMAP_1", "UMAP_2")
+pc_data_gd2 <- FetchData(gderm_2, 
+                     vars = columns)
+# Adding cluster label to center of cluster on UMAP
+umap_label_gd2 <- FetchData(gderm_2, 
+  vars = c("ident", "UMAP_1", "UMAP_2"))  %>%
+  group_by(ident) %>%
+  summarise(x=mean(UMAP_1), y=mean(UMAP_2))
+# Plotting a UMAP plot for each of the PCs
+
+map(paste0("PC_", 1:10), function(pc){
+        ggplot(pc_data_gd2, 
+               aes(UMAP_1, UMAP_2)) +
+                geom_point(aes_string(color=pc), 
+                           alpha = 0.7) +
+                scale_color_gradient(guide = FALSE, 
+                                     low = "grey90", 
+                                     high = "blue")  +
+                geom_text(data=umap_label_gd2, 
+                          aes(label=ident, x, y)) +
+                ggtitle(pc)
+}) %>% 
+        plot_grid(plotlist = .)
+#saved as gderm2_pcplots_umap_092023
+
+DimPlot(gderm_2, reduction = "pca", label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5))
+
+stdev_gderm2 <- Stdev(gderm_2, reduction = "pca")
+
+pca_gd2 <- pc_data_gd2
+pca_gd2$sym_state <- gderm_2@meta.data$condition
+summary(aov(PC_1 ~ sym_state, data = pca_gd2)) #7.03e-05 ***
+summary(aov(PC_2 ~ sym_state, data = pca_gd2)) #0.847
+summary(aov(PC_3 ~ sym_state, data = pca_gd2)) #0.000411 ***
+summary(aov(PC_4 ~ sym_state, data = pca_gd2)) #<2e-16 ***
+summary(aov(PC_5 ~ sym_state, data = pca_gd2)) #0.00823 **                               
+summary(aov(PC_6 ~ sym_state, data = pca_gd2)) #1.31e-09 ***
+summary(aov(PC_7 ~ sym_state, data = pca_gd2)) #8.98e-16 ***
+summary(aov(PC_8 ~ sym_state, data = pca_gd2)) #1.23e-07 ***
+summary(aov(PC_9 ~ sym_state, data = pca_gd2)) #0.0189 *
+summary(aov(PC_10 ~ sym_state, data = pca_gd2)) #0.0959 .
+
+#4 and 7 are the best but there are other contenders too
+adonis2(pca_gd2[,c(4,7)] ~ sym_state, data = pca_gd2[c(4,7,14)], method='eu', na.rm = TRUE)
+#           Df SumOfSqs      R2     F Pr(>F)   
+#sym_state    1   1813.5 0.07386 93.788  0.001 ***
+#Residual  1176  22739.5 0.92614                  
+#Total     1177  24553.0 1.00000                
+
+li_gd2 <- stdev_gderm2^2 / sum(stdev_gderm2^2)
+pc4v_gd2 <- round(li_gd2[4] * 100, 1) #3 of variance
+pc7v_gd2 <- round(li_gd2[7] * 100, 1) #2.1 of variance
+
+#let's also look at 1
+pc1v_gd2 <- round(li_gd2[1] * 100, 1) #35.6% of variance jeez
+
+gd2_pc4.7 <- DimPlot(gderm_2, reduction = "pca", dims = c(4, 7), label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + xlab(paste0("PC4: ",pc4v_gd2,"% variance")) + ylab(paste0("PC7: ", pc7v_gd2, "% variance"))
+#saved as gderm2_pc4_pc7_020124 with 5x4.5 dims
+gd2_pc1.4 <- DimPlot(gderm_2, reduction = "pca", dims = c(1, 4), label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + xlab(paste0("PC1: ",pc1v_gd2,"% variance")) + ylab(paste0("PC4: ", pc4v_gd2, "% variance"))
+#saved as gderm2_pc1_pc4_020124 with 5x4.5 dims
+gd2_pc1.7 <- DimPlot(gderm_2, reduction = "pca", dims = c(1, 7), label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + xlab(paste0("PC1: ",pc1v_gd2,"% variance")) + ylab(paste0("PC7: ", pc7v_gd2, "% variance"))
+#saved as gderm2_pc1_pc7_020124 with 5x4.5 dims
+
+print(gderm_2[["pca"]], dims = 1:7, nfeatures = 10)
+#PC_ 1 
+#Positive:  ANKS3, EVM.20prediction.20chromosome.8.47, ANO8, ICT1.1, MFS12.13, FBP1, FBXL7.1, MET7A, DRI, EVM.20prediction.20chromosome.8.1240 
+#Negative:  RS10, RL12, RL18A, RL18, RS23, RL7, RL7A, RL13, RL19, RL6 
+#PC_ 4 
+#Positive:  GDF8, UHRF1.1, SMC2, RECK.1, MSH6, ATAD5, SMC4, GAS1, BAZ1B.1, CHSTB.28 
+#Negative:  MMP10, EVM.20prediction.20chromosome.6.876, TRAF3.10, HSP71, BAGS.1, EVM.20prediction.20chromosome.11.2501, CO4A2.5, DNAJ1, BTBD6.67, EVM.20prediction.20chromosome.5.44 
+#PC_7
+#Positive:  EVM.20prediction.20chromosome.8.2757, LAMP1.1, PESC, RFC3.1, LTOR3, SFRP2, CH60, NDKB.3, COCA1.12, GDF8.1 
+#Negative:  KI20A, TRPC5.15, EVM.20prediction.20chromosome.4.1904, EVM.20prediction.20chromosome.4.186, CILP1.6, ASSY.1, DLGP5, EVM.20prediction.20chromosome.10.56, EVM.20prediction.20chromosome.4.2475, PLCL.5 
+
+DefaultAssay(gderm_2) <- "RNA"
+gderm_2[["RNA"]]@counts<-as.matrix(gderm_2[["RNA"]]@counts)+1
+
+
+gderm2_mark <- FindMarkers(gderm_2, ident.1 = "sym", ident.2="apo", group.by = "condition", test.use="DESeq2", slot = "counts")
+head(gderm2_mark)
+#pretty sure in this case neg lfc means down in sym; pos lfc means up in sym
+gderm2_mark <- rownames_to_column(gderm2_mark, var="gene_symbol")
+
+gderm2_pc1_feat <- c("ANKS3", "EVM.20prediction.20chromosome.8.47", "ANO8", "ICT1.1", "MFS12.13", "FBP1", "FBXL7.1", "MET7A", "DRI", "EVM.20prediction.20chromosome.8.1240", "RS10", "RL12", "RL18A", "RL18", "RS23", "RL7", "RL7A", "RL13", "RL19", "RL6")
+
+gderm2_pc4_feat <- c("GDF8", "UHRF1.1", "SMC2", "RECK.1", "MSH6", "ATAD5", "SMC4", "GAS1", "BAZ1B.1", "CHSTB.28", "MMP10", "EVM.20prediction.20chromosome.6.876", "TRAF3.10", "HSP71", "BAGS.1", "EVM.20prediction.20chromosome.11.2501", "CO4A2.5", "DNAJ1", "BTBD6.67", "EVM.20prediction.20chromosome.5.44")
+
+gderm2_pc7_feat <-c("EVM.20prediction.20chromosome.8.2757", "LAMP1.1", "PESC", "RFC3.1", "LTOR3", "SFRP2", "CH60", "NDKB.3", "COCA1.12", "GDF8.1", "KI20A", "TRPC5.15", "EVM.20prediction.20chromosome.4.1904", "EVM.20prediction.20chromosome.4.186", "CILP1.6", "ASSY.1", "DLGP5", "EVM.20prediction.20chromosome.10.56", "EVM.20prediction.20chromosome.4.2475", "PLCL.5")
+
+#visualize the pc1 features in barplot
+gderm2_pc1_mark <- subset(gderm2_mark, gene_symbol %in% gderm2_pc1_feat)
+# add a column of NAs
+gderm2_pc1_mark$diffexpressed <- "ns"
+# if log2Foldchange > 0 set as "SYM"
+gderm2_pc1_mark$diffexpressed[gderm2_pc1_mark$avg_log2FC > 0] <- "SYM"
+# if log2Foldchange < 0 set as "APO"
+gderm2_pc1_mark$diffexpressed[gderm2_pc1_mark$avg_log2FC < 0] <- "APO"
+
+gderm2_pc1_bar <- ggplot(data=gderm2_pc1_mark, aes(y=gene_symbol, x=avg_log2FC, fill=diffexpressed)) +
+  geom_bar(position="stack", stat="identity", color="black", alpha=0.6)+
+  scale_fill_manual(values=c("gray40", "#CC6600"))+
+  theme_classic()
+##saved as gderm2_pc1_barplot as landscape 8x5
+
+#visualize the pc4 features in barplot
+gderm2_pc4_mark <- subset(gderm2_mark, gene_symbol %in% gderm2_pc4_feat)
+# add a column of NAs
+gderm2_pc4_mark$diffexpressed <- "ns"
+# if log2Foldchange > 0 set as "SYM"
+gderm2_pc4_mark$diffexpressed[gderm2_pc4_mark$avg_log2FC > 0] <- "SYM"
+# if log2Foldchange < 0 set as "APO"
+gderm2_pc4_mark$diffexpressed[gderm2_pc4_mark$avg_log2FC < 0] <- "APO"
+gderm2_pc4_bar <- ggplot(data=gderm2_pc4_mark, aes(y=gene_symbol, x=avg_log2FC, fill=diffexpressed)) +
+  geom_bar(position="stack", stat="identity", color="black", alpha=0.6)+
+  scale_fill_manual(values=c("gray40", "#CC6600"))+
+  theme_classic()
+##saved as gderm2_pc4_barplot as 8x5 landscape
+
+#visualize the pc7 features in barplot
+gderm2_pc7_mark <- subset(gderm2_mark, gene_symbol %in% gderm2_pc7_feat)
+# add a column of NAs
+gderm2_pc7_mark$diffexpressed <- "ns"
+# if log2Foldchange > 0 set as "SYM"
+gderm2_pc7_mark$diffexpressed[gderm2_pc7_mark$avg_log2FC > 0] <- "SYM"
+# if log2Foldchange < 0 set as "APO"
+gderm2_pc7_mark$diffexpressed[gderm2_pc7_mark$avg_log2FC < 0] <- "APO"
+gderm2_pc7_bar <- ggplot(data=gderm2_pc7_mark, aes(y=gene_symbol, x=avg_log2FC, fill=diffexpressed)) +
+  geom_bar(position="stack", stat="identity", color="black", alpha=0.6)+
+  scale_fill_manual(values=c("gray40", "#CC6600"))+
+  theme_classic()
+##saved as gderm2_pc7_barplot as 8x5 landscape
+```
+
+
+Look at subcluster marker genes
+```{r}
+gderm2_markers_subclust <- FindAllMarkers(gderm_2, 
+                          min.pct = -Inf, 
+                          logfc.threshold = .5, 
+                          only.pos = T, 
+                          test.use = "MAST",
+                          latent.vars = c('percent.mt', 'nFeature_RNA'))
+
+gderm2_markers_subclust
+#1 doesn't have any marker genes at this logfc.threshold
+#2 has lots of HSP/HSF, TRAF, Cathepsin, SODC, BCL2
+
+percent_cluster_gderm2 <- prop.table(table(Idents(gderm_2), gderm_2@meta.data$condition), margin = 2)
+
+prop_cluster_gderm2 <- as.data.frame(percent_cluster_gderm2) %>%
+  mutate(Cluster = Var1,
+         Condition = Var2) %>%
+  ggplot(., aes(Cluster, Freq, fill = Condition)) +
+  geom_bar(stat = 'identity', position = 'dodge', color="black", width=0.6) +
+  scale_fill_manual(values=alpha(c("gray40", "#CC6600"), 0.75))+
+  ylab("Proportion of Cells per Library")+
+  coord_flip()+
+  theme(panel.background = element_rect(color="black", fill="white"),
+        panel.grid.major = element_line(colour = "gray80", linewidth = 0.5, linetype="dotted"))
+#prop_cluster_gderm2 as 4x4 landscape
+
+#get apo vs sym differences for subcluster 1 of gderm1
+gderm2_1 <- subset(gderm_2, idents="1")
+DefaultAssay(gderm2_1) <- "RNA"
+
+gderm2_1_mark <- FindMarkers(gderm2_1, ident.1 = "sym", ident.2="apo", group.by = "condition", test.use="DESeq2", slot = "counts")
+head(gderm2_1_mark)
+
+gderm2_1_mark <- rownames_to_column(gderm2_1_mark, var="gene_symbol")
+
+#get apo vs sym differences for subcluster 2 of gderm1
+gderm2_2 <- subset(gderm_2, idents="2")
+DefaultAssay(gderm2_2) <- "RNA"
+
+gderm2_2_mark <- FindMarkers(gderm2_2, ident.1 = "sym", ident.2="apo", group.by = "condition", test.use="DESeq2", slot = "counts")
+head(gderm2_2_mark)
+gderm2_2_mark <- rownames_to_column(gderm2_2_mark, var="gene_symbol")
+
+#and for 3
+gderm2_3 <- subset(gderm_2, idents="3")
+DefaultAssay(gderm2_3) <- "RNA"
+
+#gderm2_3_mark <- FindMarkers(gderm2_3, ident.1 = "sym", ident.2="apo", group.by = "condition", test.use="DESeq2", slot = "counts")
+#head(gderm2_3_mark)
+#gderm2_3_mark <- rownames_to_column(gderm2_3_mark, var="gene_symbol")
+###Error in ValidateCellGroups(object = object, cells.1 = cells.1, cells.2 = cells.2,  : 
+  ###Cell group 2 has fewer than 3 cells
+```
+
+Top 10 pos and neg features driving pcs1-5 with annotated gene names
+```{r}
+print(gderm_2[["pca"]], dims = 1:5, nfeatures = 10)
+
+gderm2_feats_1to5 <- c("ANKS3", "ANO8", "ICT1.1", "MFS12.13", "FBP1", "FBXL7.1", "MET7A", "DRI", "RS10", "RL12", "RL18A", "RL18", "RS23", "RL7", "RL7A", "RL13", "RL19", "RL6", "APOB.1", "PPN", "NAS4.1", "VIT", "NAS15.13", "SFRP2", "MOT10.15", "RSPO3", "DJC21", "DEK", "MLP2", "HELLS", "CYTB", "MSH6", "VKORL", "RFC3.1", "SMC2", "CENPE.1", "ATAD5", "BAZ1B.1", "STA13", "NASP", "ZN431.2", "GXN.18", "SPEG", "CALM.20", "MLP2", "TYB.1", "WNT8A.1", "ORCT.5", "NPTX1.15", "CRIP1.2", "GDF8", "UHRF1.1", "SMC2", "RECK.1", "MSH6", "ATAD5", "SMC4", "GAS1", "BAZ1B.1", "CHSTB.28", "MMP10", "TRAF3.10", "HSP71", "BAGS.1", "CO4A2.5", "DNAJ1", "BTBD6.67", "ATOX1", "JAG1A.1", "Y1760.1", "LHPL2", "SMC4", "SPSB3.1", "BTBD6.67", "SBP1.1", "PS11A", "TBA1.3", "CES2", "CH60", "NOP58", "GSTMU")
+
+gderm2_1to5_mark <- subset(gderm2_mark, gene_symbol %in% gderm2_feats_1to5)
+# add a column of NAs
+gderm2_1to5_mark$diffexpressed <- "ns"
+# if log2Foldchange > 0 set as "SYM"
+gderm2_1to5_mark$diffexpressed[gderm2_1to5_mark$avg_log2FC > 0] <- "SYM"
+# if log2Foldchange < 0 set as "APO"
+gderm2_1to5_mark$diffexpressed[gderm2_1to5_mark$avg_log2FC < 0] <- "APO"
+gderm2_1to5_bar <- ggplot(data=gderm2_1to5_mark, aes(y=gene_symbol, x=avg_log2FC, fill=diffexpressed)) +
+  geom_bar(position="stack", stat="identity", color="black", alpha=0.6)+
+  scale_fill_manual(values=c("gray40", "#CC6600"))+
+  theme_classic()
+```
+
+
+#Gastrodermis 3
+```{r}
+gastrodermis3 <- subset(oculina_named_h, idents = "Gastrodermis 3") 
+
+gderm_3 <- FindVariableFeatures(gastrodermis3, selection.method = "vst")
+gderm_3 <- ScaleData(gderm_3, verbose = FALSE, assay="RNA")
+gderm_3 <- RunPCA(gderm_3)
+gderm_3 <- RunUMAP(gderm_3, reduction="pca", dims=1:30, return.model=TRUE)
+gderm_3 <- FindNeighbors(gderm_3, reduction ="pca", dims=1:30)
+
+gderm_3 <- FindClusters(gderm_3, resolution = 0.25)
+#3
+
+gderm_3@meta.data$seurat_clusters <- as.numeric(as.character(gderm_3@meta.data$seurat_clusters))+1
+Idents(gderm_3)<- "seurat_clusters"
+gderm_3$seurat_clusters
+gderm_3@active.ident <- factor(x = gderm_3@active.ident, levels = 1:3)
+gderm_3@active.ident
+
+plot9 <- DimPlot(gderm_3, reduction = "umap", label = T)
+plot10 <- DimPlot(gderm_3, reduction = "umap", label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + ggtitle("") + theme(legend.text=element_text(size=10))
+#no one cluster that is only syms or only apos
+
+#umap_gderm3_plot9plot10 10x4
+```
+
+```{r}
+gderm3_topfeat <- TopFeatures(object = gderm_3[["pca"]], dim = 1, nfeatures = 20, balanced = TRUE)
+gderm_3[["umap"]]@cell.embeddings
+columns <- c(paste0("PC_", 1:10),
+            "ident",
+            "UMAP_1", "UMAP_2")
+pc_data_gd3 <- FetchData(gderm_3, 
+                     vars = columns)
+# Adding cluster label to center of cluster on UMAP
+umap_label_gd3 <- FetchData(gderm_3, 
+  vars = c("ident", "UMAP_1", "UMAP_2"))  %>%
+  group_by(ident) %>%
+  summarise(x=mean(UMAP_1), y=mean(UMAP_2))
+# Plotting a UMAP plot for each of the PCs
+
+map(paste0("PC_", 1:10), function(pc){
+        ggplot(pc_data_gd3, 
+               aes(UMAP_1, UMAP_2)) +
+                geom_point(aes_string(color=pc), 
+                           alpha = 0.7) +
+                scale_color_gradient(guide = FALSE, 
+                                     low = "grey90", 
+                                     high = "blue")  +
+                geom_text(data=umap_label_gd3, 
+                          aes(label=ident, x, y)) +
+                ggtitle(pc)
+}) %>% 
+        plot_grid(plotlist = .)
+#saved as gderm3_pcplots_umap_020124
+
+DimPlot(gderm_3, reduction = "pca", label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5))
+
+stdev_gderm3 <- Stdev(gderm_3, reduction = "pca")
+
+pca_gd3 <- pc_data_gd3
+pca_gd3$sym_state <- gderm_3@meta.data$condition
+summary(aov(PC_1 ~ sym_state, data = pca_gd3)) #0.000204 ***
+summary(aov(PC_2 ~ sym_state, data = pca_gd3)) #0.0025 **
+summary(aov(PC_3 ~ sym_state, data = pca_gd3)) #5.96e-05 ***
+summary(aov(PC_4 ~ sym_state, data = pca_gd3)) #0.000194 ***
+summary(aov(PC_5 ~ sym_state, data = pca_gd3)) #0.863                               
+summary(aov(PC_6 ~ sym_state, data = pca_gd3)) #<2e-16 ***
+summary(aov(PC_7 ~ sym_state, data = pca_gd3)) #1.93e-06 ***
+summary(aov(PC_8 ~ sym_state, data = pca_gd3)) #2.87e-05 ***
+summary(aov(PC_9 ~ sym_state, data = pca_gd3)) #3.3e-11 ***
+summary(aov(PC_10 ~ sym_state, data = pca_gd3)) #0.247
+
+#6 and 9 are the best but maybe also check 1, 3, 4, 7, 8
+adonis2(pca_gd3[,c(6,9)] ~ sym_state, data = pca_gd3[c(6,9,14)], method='eu', na.rm = TRUE)
+#           Df SumOfSqs      R2     F Pr(>F)   
+#  sym_state   1   2388.9 0.13519 138.97  0.001 ***
+#Residual  889  15281.6 0.86481                  
+#Total     890  17670.5 1.00000 
+
+adonis2(pca_gd3[,c(1,6)] ~ sym_state, data = pca_gd3[c(1,6,14)], method='eu', na.rm = TRUE)
+#0.001 ***
+adonis2(pca_gd3[,c(1,9)] ~ sym_state, data = pca_gd3[c(1,9,14)], method='eu', na.rm = TRUE)
+#0.001 ***
+
+li_gd3 <- stdev_gderm3^2 / sum(stdev_gderm3^2)
+pc1v_gd3 <- round(li_gd3[1] * 100, 1) #10.8 of variance
+pc6v_gd3 <- round(li_gd3[6] * 100, 1) #2.9 of variance
+pc9v_gd3 <- round(li_gd3[9] * 100, 1) #2.3 of variance jeez
+
+gd3_pc1.6 <- DimPlot(gderm_3, reduction = "pca", dims = c(1, 6), label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + xlab(paste0("PC1: ",pc1v_gd3,"% variance")) + ylab(paste0("PC6: ", pc6v_gd3, "% variance"))
+#saved as gderm3_pc1_pc6_020124 with 5x4.5 dims
+gd3_pc1.9 <- DimPlot(gderm_3, reduction = "pca", dims = c(1, 9), label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + xlab(paste0("PC1: ",pc1v_gd3,"% variance")) + ylab(paste0("PC9: ", pc9v_gd3, "% variance"))
+#saved as gderm3_pc1_pc9_020124 with 5x4.5 dims
+gd3_pc6.9 <- DimPlot(gderm_3, reduction = "pca", dims = c(6, 9), label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + xlab(paste0("PC6: ",pc6v_gd3,"% variance")) + ylab(paste0("PC9: ", pc9v_gd3, "% variance"))
+#saved as gderm3_pc6_pc9_020124 with 5x4.5 dims
+
+print(gderm_3[["pca"]], dims = 1:10, nfeatures = 10)
+#PC_ 1 
+#Positive:   EVM.20prediction.20chromosome.13.577, SCR1.2, EVM.20prediction.20chromosome.10.1207, EVM.20prediction.20chromosome.8.238, EVM.20prediction.20chromosome.14.3777, EVM.20prediction.20chromosome.13.1695, EVM.20prediction.20chromosome.3.809, PGCA.20, CAH2.2, EVM.20prediction.20chromosome.1.95 
+#Negative:  EVM.20prediction.20chromosome.12.2570, ERG, NELL2.1, RBP2A.2, MYS.2, THYG.1, CO4A1.2, MMP25, CO4A2.8, FGFR1.6 
+
+#PC_ 6 
+#Positive: TITIN, PKHL1.1, EVM.20prediction.20chromosome.10.468, DNMT1, EVM.20prediction.20chromosome.9.2608, EVM.20prediction.20chromosome.1.1030, CO4A1.2, HIS8.1, FGFR1.11, CY24B 
+#Negative:  BAGS.1, USOM7.10, CATL.9, HEBP2.2, MMP10, TRAF3.10, PEAM1, EVM.20prediction.20chromosome.4.1227, EVM.20prediction.20chromosome.5.44, SIK2 
+
+#PC_9
+#Positive:  STIM1, ACH10, TNR19, BCL3, ETS1A.3, ETS1B, TTC28.98, FBX4, DEN5B.1, TNIP1 
+#Negative:  GBP3, EVM.20prediction.20chromosome.5.938, DTX3L, EVM.20prediction.20chromosome.7.2826, ALPS.1, IFIH1.1, EVM.20prediction.20chromosome.10.1881, EVM.20prediction.20chromosome.9.1013, EVM.20prediction.20chromosome.12.2605, EVM.20prediction.20chromosome.10.1865 
+
+DefaultAssay(gderm_3) <- "RNA"
+gderm_3[["RNA"]]@counts<-as.matrix(gderm_3[["RNA"]]@counts)+1
+
+
+gderm3_mark <- FindMarkers(gderm_3, ident.1 = "sym", ident.2="apo", group.by = "condition", test.use="DESeq2", slot = "counts")
+head(gderm3_mark)
+#pretty sure in this case neg lfc means down in sym; pos lfc means up in sym
+gderm3_mark <- rownames_to_column(gderm3_mark, var="gene_symbol")
+
+gderm3_pc1_feat <- c("EVM.20prediction.20chromosome.13.577", "SCR1.2", "EVM.20prediction.20chromosome.10.1207", "EVM.20prediction.20chromosome.8.238", "EVM.20prediction.20chromosome.14.3777", "EVM.20prediction.20chromosome.13.1695", "EVM.20prediction.20chromosome.3.809", "PGCA.20", "CAH2.2", "EVM.20prediction.20chromosome.1.95", "EVM.20prediction.20chromosome.12.2570", "ERG", "NELL2.1", "RBP2A.2", "MYS.2", "THYG.1", "CO4A1.2", "MMP25", "CO4A2.8", "FGFR1.6")
+
+gderm3_pc6_feat <- c("TITIN", "PKHL1.1", "EVM.20prediction.20chromosome.10.468", "DNMT1", "EVM.20prediction.20chromosome.9.2608", "EVM.20prediction.20chromosome.1.1030", "CO4A1.2", "HIS8.1", "FGFR1.11", "CY24B", "BAGS.1", "USOM7.10", "CATL.9", "HEBP2.2", "MMP10", "TRAF3.10", "PEAM1", "EVM.20prediction.20chromosome.4.1227", "EVM.20prediction.20chromosome.5.44", "SIK2")
+
+gderm3_pc9_feat <-c("STIM1", "ACH10", "TNR19", "BCL3", "ETS1A.3", "ETS1B", "TTC28.98", "FBX4", "DEN5B.1", "TNIP1", "GBP3, EVM.20prediction.20chromosome.5.938", "DTX3L", "EVM.20prediction.20chromosome.7.2826", "ALPS.1", "IFIH1.1", "EVM.20prediction.20chromosome.10.1881", "EVM.20prediction.20chromosome.9.1013", "EVM.20prediction.20chromosome.12.2605", "EVM.20prediction.20chromosome.10.1865")
+
+#visualize the pc1 features in barplot
+gderm3_pc1_mark <- subset(gderm3_mark, gene_symbol %in% gderm3_pc1_feat)
+# add a column of NAs
+gderm3_pc1_mark$diffexpressed <- "ns"
+# if log2Foldchange > 0 set as "SYM"
+gderm3_pc1_mark$diffexpressed[gderm3_pc1_mark$avg_log2FC > 0] <- "SYM"
+# if log2Foldchange < 0 set as "APO"
+gderm3_pc1_mark$diffexpressed[gderm3_pc1_mark$avg_log2FC < 0] <- "APO"
+
+gderm3_pc1_bar <- ggplot(data=gderm3_pc1_mark, aes(y=gene_symbol, x=avg_log2FC, fill=diffexpressed)) +
+  geom_bar(position="stack", stat="identity", color="black", alpha=0.6)+
+  scale_fill_manual(values=c("gray40", "#CC6600"))+
+  theme_classic()
+##saved as gderm3_pc1_barplot as landscape 8x5
+
+#visualize the pc6 features in barplot
+gderm3_pc6_mark <- subset(gderm3_mark, gene_symbol %in% gderm3_pc6_feat)
+# add a column of NAs
+gderm3_pc6_mark$diffexpressed <- "ns"
+# if log2Foldchange > 0 set as "SYM"
+gderm3_pc6_mark$diffexpressed[gderm3_pc6_mark$avg_log2FC > 0] <- "SYM"
+# if log2Foldchange < 0 set as "APO"
+gderm3_pc6_mark$diffexpressed[gderm3_pc6_mark$avg_log2FC < 0] <- "APO"
+gderm3_pc6_bar <- ggplot(data=gderm3_pc6_mark, aes(y=gene_symbol, x=avg_log2FC, fill=diffexpressed)) +
+  geom_bar(position="stack", stat="identity", color="black", alpha=0.6)+
+  scale_fill_manual(values=c("gray40", "#CC6600"))+
+  theme_classic()
+##saved as gderm3_pc6_barplot as 8x5 landscape
+
+#visualize the pc9 features in barplot
+gderm3_pc9_mark <- subset(gderm3_mark, gene_symbol %in% gderm3_pc9_feat)
+# add a column of NAs
+gderm3_pc9_mark$diffexpressed <- "ns"
+# if log2Foldchange > 0 set as "SYM"
+gderm3_pc9_mark$diffexpressed[gderm3_pc9_mark$avg_log2FC > 0] <- "SYM"
+# if log2Foldchange < 0 set as "APO"
+gderm3_pc9_mark$diffexpressed[gderm3_pc9_mark$avg_log2FC < 0] <- "APO"
+gderm3_pc9_bar <- ggplot(data=gderm3_pc9_mark, aes(y=gene_symbol, x=avg_log2FC, fill=diffexpressed)) +
+  geom_bar(position="stack", stat="identity", color="black", alpha=0.6)+
+  scale_fill_manual(values=c("gray40", "#CC6600"))+
+  theme_classic()
+##saved as gderm3_pc9_barplot as 8x5 landscape
+#very kow log2fc
+```
+
+Look at subcluster marker genes
+```{r}
+gderm3_markers_subclust <- FindAllMarkers(gderm_3, 
+                          min.pct = -Inf, 
+                          logfc.threshold = .5, 
+                          only.pos = T, 
+                          test.use = "MAST",
+                          latent.vars = c('percent.mt', 'nFeature_RNA'))
+
+gderm3_markers_subclust
+#2 has none
+```
+
+#Gastrodermis 4
+```{r}
+gastrodermis4 <- subset(oculina_named_h, idents = "Gastrodermis 4") 
+
+gderm_4 <- FindVariableFeatures(gastrodermis4, selection.method = "vst")
+gderm_4 <- ScaleData(gderm_4, verbose = FALSE, assay="RNA")
+gderm_4 <- RunPCA(gderm_4)
+gderm_4 <- RunUMAP(gderm_4, reduction="pca", dims=1:30, return.model=TRUE)
+gderm_4 <- FindNeighbors(gderm_4, reduction ="pca", dims=1:30)
+
+gderm_4 <- FindClusters(gderm_4, resolution = 0.25)
+#3
+
+gderm_4@meta.data$seurat_clusters <- as.numeric(as.character(gderm_4@meta.data$seurat_clusters))+1
+Idents(gderm_4)<- "seurat_clusters"
+gderm_4$seurat_clusters
+gderm_4@active.ident <- factor(x = gderm_4@active.ident, levels = 1:3)
+gderm_4@active.ident
+
+plot11 <- DimPlot(gderm_4, reduction = "umap", label = T)
+plot12 <- DimPlot(gderm_4, reduction = "umap", label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + ggtitle("") + theme(legend.text=element_text(size=10))
+#again, no one cluster that is only syms or only apos
+#but def some weird shapes goin on
+
+#umap_gderm4_plot11plot12 10x4
+```
+
+```{r}
+gderm4_topfeat <- TopFeatures(object = gderm_4[["pca"]], dim = 1, nfeatures = 20, balanced = TRUE)
+gderm_4[["umap"]]@cell.embeddings
+columns <- c(paste0("PC_", 1:10),
+            "ident",
+            "UMAP_1", "UMAP_2")
+pc_data_gd4 <- FetchData(gderm_4, 
+                     vars = columns)
+# Adding cluster label to center of cluster on UMAP
+umap_label_gd4 <- FetchData(gderm_4, 
+  vars = c("ident", "UMAP_1", "UMAP_2"))  %>%
+  group_by(ident) %>%
+  summarise(x=mean(UMAP_1), y=mean(UMAP_2))
+# Plotting a UMAP plot for each of the PCs
+
+map(paste0("PC_", 1:10), function(pc){
+        ggplot(pc_data_gd4, 
+               aes(UMAP_1, UMAP_2)) +
+                geom_point(aes_string(color=pc), 
+                           alpha = 0.7) +
+                scale_color_gradient(guide = FALSE, 
+                                     low = "grey90", 
+                                     high = "blue")  +
+                geom_text(data=umap_label_gd4, 
+                          aes(label=ident, x, y)) +
+                ggtitle(pc)
+}) %>% 
+        plot_grid(plotlist = .)
+#saved as gderm4_pcplots_umap_020124
+
+DimPlot(gderm_4, reduction = "pca", label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5))
+
+stdev_gderm4 <- Stdev(gderm_4, reduction = "pca")
+
+pca_gd4 <- pc_data_gd4
+pca_gd4$sym_state <- gderm_4@meta.data$condition
+summary(aov(PC_1 ~ sym_state, data = pca_gd4)) #1.57e-05 ***
+summary(aov(PC_2 ~ sym_state, data = pca_gd4)) #0.101
+summary(aov(PC_3 ~ sym_state, data = pca_gd4)) #0.492
+summary(aov(PC_4 ~ sym_state, data = pca_gd4)) #0.741
+summary(aov(PC_5 ~ sym_state, data = pca_gd4)) #0.031 *                               
+summary(aov(PC_6 ~ sym_state, data = pca_gd4)) #0.0854 .
+summary(aov(PC_7 ~ sym_state, data = pca_gd4)) #0.249
+summary(aov(PC_8 ~ sym_state, data = pca_gd4)) #0.243
+summary(aov(PC_9 ~ sym_state, data = pca_gd4)) #0.291
+summary(aov(PC_10 ~ sym_state, data = pca_gd4)) #0.858
+
+#1 and 5 only
+adonis2(pca_gd4[,c(1,5)] ~ sym_state, data = pca_gd4[c(1,5,14)], method='eu', na.rm = TRUE)
+#           Df SumOfSqs      R2     F Pr(>F)   
+#  sym_state   1     2325 0.05147 16.169  0.001 ***
+#Residual  298    42845 0.94853                  
+#Total     299    45169 1.00000 
+
+li_gd4 <- stdev_gderm4^2 / sum(stdev_gderm4^2)
+pc1v_gd4 <- round(li_gd4[1] * 100, 1) #12.7 of variance
+pc5v_gd4 <- round(li_gd4[5] * 100, 1) #3.3 of variance
+
+gd4_pc1.5 <- DimPlot(gderm_4, reduction = "pca", dims = c(1, 5), label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + xlab(paste0("PC1: ",pc1v_gd4,"% variance")) + ylab(paste0("PC5: ", pc5v_gd4, "% variance"))
+#saved as gderm4_pc1_pc5_020124 with 5x4.5 dims
+
+print(gderm_4[["pca"]], dims = 1:10, nfeatures = 10)
+#PC_ 1 
+#Positive:   TPX2, CCNB3, DLGP5, INCEA, KMT5A, EVM.20prediction.20chromosome.11.1624, PYM1, CKS1.2, EVM.20prediction.20chromosome.10.1267, CC146 
+#Negative:  ZPP.5, CAH2.2, H5.3, SPD2B.2, NRP2.13, EVM.20prediction.20chromosome.5.1925, EVM.20prediction.20chromosome.6.2756, LRP6.17, TPM.1, EVM.20prediction.20chromosome.5.1941 
+
+#PC_ 5 
+#Positive: H4.12, EVM.20prediction.20chromosome.1.1030, EVM.20prediction.20chromosome.8.883, EVM.20prediction.20chromosome.11.2501, RL22, TRAF3.9, DNAJ1, BAGS.1, ACTC.2, H10.1 
+#Negative:  TTLL4, DPGN, PTHD3.7, EVM.20prediction.20chromosome.6.136, ARSB.24, EVM.20prediction.20chromosome.1.1199, LIN41.76, EVM.20prediction.20chromosome.4.30, NPHP3.3, GBP6.3
+
+
+DefaultAssay(gderm_4) <- "RNA"
+gderm_4[["RNA"]]@counts<-as.matrix(gderm_4[["RNA"]]@counts)+1
+
+
+gderm4_mark <- FindMarkers(gderm_4, ident.1 = "sym", ident.2="apo", group.by = "condition", test.use="DESeq2", slot = "counts")
+head(gderm4_mark)
+#pretty sure in this case neg lfc means down in sym; pos lfc means up in sym
+gderm4_mark <- rownames_to_column(gderm4_mark, var="gene_symbol")
+
+gderm4_pc1_feat <- c("TPX2", "CCNB3", "DLGP5", "INCEA", "KMT5A", "EVM.20prediction.20chromosome.11.1624", "PYM1", "CKS1.2", "EVM.20prediction.20chromosome.10.1267", "CC146", "ZPP.5", "CAH2.2", "H5.3", "SPD2B.2", "NRP2.13", "EVM.20prediction.20chromosome.5.1925", "EVM.20prediction.20chromosome.6.2756", "LRP6.17", "TPM.1", "EVM.20prediction.20chromosome.5.1941")
+
+gderm4_pc5_feat <- c("H4.12", "EVM.20prediction.20chromosome.1.1030", "EVM.20prediction.20chromosome.8.883", "EVM.20prediction.20chromosome.11.2501", "RL22", "TRAF3.9", "DNAJ1", "BAGS.1", "ACTC.2", "H10.1", "TTLL4", "DPGN", "PTHD3.7", "EVM.20prediction.20chromosome.6.136", "ARSB.24", "EVM.20prediction.20chromosome.1.1199", "LIN41.76", "EVM.20prediction.20chromosome.4.30", "NPHP3.3", "GBP6.3")
+
+
+#visualize the pc1 features in barplot
+gderm4_pc1_mark <- subset(gderm4_mark, gene_symbol %in% gderm4_pc1_feat)
+# add a column of NAs
+gderm4_pc1_mark$diffexpressed <- "ns"
+# if log2Foldchange > 0 set as "SYM"
+gderm4_pc1_mark$diffexpressed[gderm4_pc1_mark$avg_log2FC > 0] <- "SYM"
+# if log2Foldchange < 0 set as "APO"
+gderm4_pc1_mark$diffexpressed[gderm4_pc1_mark$avg_log2FC < 0] <- "APO"
+
+gderm4_pc1_bar <- ggplot(data=gderm4_pc1_mark, aes(y=gene_symbol, x=avg_log2FC, fill=diffexpressed)) +
+  geom_bar(position="stack", stat="identity", color="black", alpha=0.6)+
+  scale_fill_manual(values=c("gray40", "#CC6600"))+
+  theme_classic()
+##saved as gderm4_pc1_barplot as landscape 8x5
+
+#visualize the pc5 features in barplot
+gderm4_pc5_mark <- subset(gderm4_mark, gene_symbol %in% gderm4_pc5_feat)
+# add a column of NAs
+gderm4_pc5_mark$diffexpressed <- "ns"
+# if log2Foldchange > 0 set as "SYM"
+gderm4_pc5_mark$diffexpressed[gderm4_pc5_mark$avg_log2FC > 0] <- "SYM"
+# if log2Foldchange < 0 set as "APO"
+gderm4_pc5_mark$diffexpressed[gderm4_pc5_mark$avg_log2FC < 0] <- "APO"
+gderm4_pc5_bar <- ggplot(data=gderm4_pc5_mark, aes(y=gene_symbol, x=avg_log2FC, fill=diffexpressed)) +
+  geom_bar(position="stack", stat="identity", color="black", alpha=0.6)+
+  scale_fill_manual(values=c("gray40", "#CC6600"))+
+  theme_classic()
+##saved as gderm4_pc5_barplot as 8x5 landscape
+
+```
+
+Look at subcluster marker genes
+```{r}
+gderm4_markers_subclust <- FindAllMarkers(gderm_4, 
+                          min.pct = -Inf, 
+                          logfc.threshold = .5, 
+                          only.pos = T, 
+                          test.use = "MAST",
+                          latent.vars = c('percent.mt', 'nFeature_RNA'))
+
+gderm4_markers_subclust
+#1 has none
+```
+
+Moving on from gastrodermis
+
+#Cnidocyte
+```{r}
+cnidocyte <- subset(oculina_named_h, idents = "Cnidocyte") 
+
+cnid <- FindVariableFeatures(cnidocyte, selection.method = "vst")
+cnid <- ScaleData(cnid, verbose = FALSE, assay="RNA")
+cnid <- RunPCA(cnid)
+cnid <- RunUMAP(cnid, reduction="pca", dims=1:30, return.model=TRUE)
+cnid <- FindNeighbors(cnid, reduction ="pca", dims=1:30)
+
+cnid <- FindClusters(cnid, resolution = 0.25)
+#2
+
+cnid@meta.data$seurat_clusters <- as.numeric(as.character(cnid@meta.data$seurat_clusters))+1
+Idents(cnid)<- "seurat_clusters"
+cnid$seurat_clusters
+cnid@active.ident <- factor(x = cnid@active.ident, levels = 1:2)
+cnid@active.ident
+
+plot13 <- DimPlot(cnid, reduction = "umap", label = T)
+plot14 <- DimPlot(cnid, reduction = "umap", label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + ggtitle("") + theme(legend.text=element_text(size=10))
+#umap_cnid_plot13plot14 10x4
+```
+
+```{r}
+cnid_topfeat <- TopFeatures(object = cnid[["pca"]], dim = 1, nfeatures = 20, balanced = TRUE)
+cnid[["umap"]]@cell.embeddings
+columns <- c(paste0("PC_", 1:10),
+            "ident",
+            "UMAP_1", "UMAP_2")
+pc_data_cnid <- FetchData(cnid, 
+                     vars = columns)
+# Adding cluster label to center of cluster on UMAP
+umap_label_cnid <- FetchData(cnid, 
+  vars = c("ident", "UMAP_1", "UMAP_2"))  %>%
+  group_by(ident) %>%
+  summarise(x=mean(UMAP_1), y=mean(UMAP_2))
+# Plotting a UMAP plot for each of the PCs
+
+map(paste0("PC_", 1:10), function(pc){
+        ggplot(pc_data_cnid, 
+               aes(UMAP_1, UMAP_2)) +
+                geom_point(aes_string(color=pc), 
+                           alpha = 0.7) +
+                scale_color_gradient(guide = FALSE, 
+                                     low = "grey90", 
+                                     high = "blue")  +
+                geom_text(data=umap_label_cnid, 
+                          aes(label=ident, x, y)) +
+                ggtitle(pc)
+}) %>% 
+        plot_grid(plotlist = .)
+#saved as cnid_pcplots_umap_020124
+
+DimPlot(cnid, reduction = "pca", label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5))
+
+stdev_cnid <- Stdev(cnid, reduction = "pca")
+
+pca_cnid <- pc_data_cnid
+pca_cnid$sym_state <- cnid@meta.data$condition
+summary(aov(PC_1 ~ sym_state, data = pca_cnid)) #0.219
+summary(aov(PC_2 ~ sym_state, data = pca_cnid)) #0.0984 .
+summary(aov(PC_3 ~ sym_state, data = pca_cnid)) #0.477
+summary(aov(PC_4 ~ sym_state, data = pca_cnid)) #0.923
+summary(aov(PC_5 ~ sym_state, data = pca_cnid)) #0.0695 .                               
+summary(aov(PC_6 ~ sym_state, data = pca_cnid)) #0.000554 ***
+summary(aov(PC_7 ~ sym_state, data = pca_cnid)) #0.445
+summary(aov(PC_8 ~ sym_state, data = pca_cnid)) #0.0225 *
+summary(aov(PC_9 ~ sym_state, data = pca_cnid)) #0.0993 .
+summary(aov(PC_10 ~ sym_state, data = pca_cnid)) #0.044 *
+
+#going to look at 6 and 8
+adonis2(pca_cnid[,c(6,8)] ~ sym_state, data = pca_cnid[c(6,8,14)], method='eu', na.rm = TRUE)
+#           Df SumOfSqs      R2     F Pr(>F)   
+# sym_state   1    353.8 0.02257 9.0046  0.001 ***
+#Residual  390  15324.6 0.97743                  
+#Total     391  15678.5 1.00000      
+
+li_cnid <- stdev_cnid^2 / sum(stdev_cnid^2)
+pc6v_cnid <- round(li_cnid[6] * 100, 1) #3.3 of variance
+pc8v_cnid <- round(li_cnid[8] * 100, 1) #2.7 of variance
+
+cnid_pc6.8 <- DimPlot(cnid, reduction = "pca", dims = c(6, 8), label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + xlab(paste0("PC6: ",pc6v_cnid,"% variance")) + ylab(paste0("PC8: ", pc8v_cnid, "% variance"))
+#saved as cnid_pc6_pc8_020124 with 5x4.5 dims
+
+print(cnid[["pca"]], dims = 1:10, nfeatures = 10)
+#PC_ 6 
+#Positive:   ATS17, ARPIN, EVM.20prediction.20chromosome.8.883, FBN2, SYT9.1, P30.1, SMTN, APLP, BAG.2, TOP2A 
+#Negative:  SAAR2.3, CP17A.22, PANP, ERG, TEBP, LRP6.17, EVM.20prediction.20chromosome.13.3335, NTH, EVM.20prediction.20chromosome.9.1849, TRPA1.1 
+
+#PC_ 8 
+#Positive: H90A1, MPPA, C1QBP, EVM.20prediction.20chromosome.10.919, MCM3, EVM.20prediction.20chromosome.11.637, EVM.20prediction.20chromosome.12.408, RUXG, TPRGL, HSP7C.1 
+#Negative:  RIMS2.1, CATB2, TDRD1.1, TGFA1, YKH3, KDISB, PRG4, EVM.20prediction.20chromosome.6.1086, FNIP2, PIM2
+
+
+DefaultAssay(cnid) <- "RNA"
+cnid[["RNA"]]@counts<-as.matrix(cnid[["RNA"]]@counts)+1
+
+
+cnid_mark <- FindMarkers(cnid, ident.1 = "sym", ident.2="apo", group.by = "condition", test.use="DESeq2", slot = "counts")
+head(cnid_mark)
+#pretty sure in this case neg lfc means down in sym; pos lfc means up in sym
+cnid_mark <- rownames_to_column(cnid_mark, var="gene_symbol")
+
+cnid_pc6_feat <- c("ATS17", "ARPIN", "EVM.20prediction.20chromosome.8.883", "FBN2", "SYT9.1", "P30.1", "SMTN", "APLP", "BAG.2", "TOP2A", "SAAR2.3", "CP17A.22", "PANP", "ERG", "TEBP", "LRP6.17", "EVM.20prediction.20chromosome.13.3335", "NTH", "EVM.20prediction.20chromosome.9.1849", "TRPA1.1")
+
+cnid_pc8_feat <- c("H90A1", "MPPA", "C1QBP", "EVM.20prediction.20chromosome.10.919", "MCM3", "EVM.20prediction.20chromosome.11.637", "EVM.20prediction.20chromosome.12.408", "RUXG", "TPRGL", "HSP7C.1", "RIMS2.1", "CATB2", "TDRD1.1", "TGFA1", "YKH3", "KDISB", "PRG4", "EVM.20prediction.20chromosome.6.1086", "FNIP2", "PIM2")
+
+
+#visualize the pc6 features in barplot
+cnid_pc6_mark <- subset(cnid_mark, gene_symbol %in% cnid_pc6_feat)
+# add a column of NAs
+cnid_pc6_mark$diffexpressed <- "ns"
+# if log2Foldchange > 0 set as "SYM"
+cnid_pc6_mark$diffexpressed[cnid_pc6_mark$avg_log2FC > 0] <- "SYM"
+# if log2Foldchange < 0 set as "APO"
+cnid_pc6_mark$diffexpressed[cnid_pc6_mark$avg_log2FC < 0] <- "APO"
+
+cnid_pc6_bar <- ggplot(data=cnid_pc6_mark, aes(y=gene_symbol, x=avg_log2FC, fill=diffexpressed)) +
+  geom_bar(position="stack", stat="identity", color="black", alpha=0.6)+
+  scale_fill_manual(values=c("gray40", "#CC6600"))+
+  theme_classic()
+##saved as cnid_pc6_barplot as landscape 8x5
+
+#visualize the pc8 features in barplot
+cnid_pc8_mark <- subset(cnid_mark, gene_symbol %in% cnid_pc8_feat)
+# add a column of NAs
+cnid_pc8_mark$diffexpressed <- "ns"
+# if log2Foldchange > 0 set as "SYM"
+cnid_pc8_mark$diffexpressed[cnid_pc8_mark$avg_log2FC > 0] <- "SYM"
+# if log2Foldchange < 0 set as "APO"
+cnid_pc8_mark$diffexpressed[cnid_pc8_mark$avg_log2FC < 0] <- "APO"
+cnid_pc8_bar <- ggplot(data=cnid_pc8_mark, aes(y=gene_symbol, x=avg_log2FC, fill=diffexpressed)) +
+  geom_bar(position="stack", stat="identity", color="black", alpha=0.6)+
+  scale_fill_manual(values=c("gray40", "#CC6600"))+
+  theme_classic()
+##saved as cnid_pc8_barplot as 8x5 landscape
+
+```
+
+Look at subcluster marker genes
+```{r}
+cnid_markers_subclust <- FindAllMarkers(cnid, 
+                          min.pct = -Inf, 
+                          logfc.threshold = .5, 
+                          only.pos = T, 
+                          test.use = "MAST",
+                          latent.vars = c('percent.mt', 'nFeature_RNA'))
+
+cnid_markers_subclust
+#1 only has a few, 2 has a lot
+```
+
+#Gland 1
+```{r}
+gland1 <- subset(oculina_named_h, idents = "Gland 1") 
+
+gland1 <- FindVariableFeatures(gland1, selection.method = "vst")
+gland1 <- ScaleData(gland1, verbose = FALSE, assay="RNA")
+gland1 <- RunPCA(gland1)
+gland1 <- RunUMAP(gland1, reduction="pca", dims=1:30, return.model=TRUE)
+gland1 <- FindNeighbors(gland1, reduction ="pca", dims=1:30)
+
+gland1 <- FindClusters(gland1, resolution = 0.25)
+#2
+
+gland1@meta.data$seurat_clusters <- as.numeric(as.character(gland1@meta.data$seurat_clusters))+1
+Idents(gland1)<- "seurat_clusters"
+gland1$seurat_clusters
+gland1@active.ident <- factor(x = gland1@active.ident, levels = 1:2)
+gland1@active.ident
+
+plot15 <- DimPlot(gland1, reduction = "umap", label = T)
+plot16 <- DimPlot(gland1, reduction = "umap", label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + ggtitle("") + theme(legend.text=element_text(size=10))
+#umap_gland1_plot15plot16 10x4
+```
+
+```{r}
+gland1_topfeat <- TopFeatures(object = gland1[["pca"]], dim = 1, nfeatures = 20, balanced = TRUE)
+gland1[["umap"]]@cell.embeddings
+columns <- c(paste0("PC_", 1:10),
+            "ident",
+            "UMAP_1", "UMAP_2")
+pc_data_gland1 <- FetchData(gland1, 
+                     vars = columns)
+# Adding cluster label to center of cluster on UMAP
+umap_label_gland1 <- FetchData(gland1, 
+  vars = c("ident", "UMAP_1", "UMAP_2"))  %>%
+  group_by(ident) %>%
+  summarise(x=mean(UMAP_1), y=mean(UMAP_2))
+# Plotting a UMAP plot for each of the PCs
+
+map(paste0("PC_", 1:10), function(pc){
+        ggplot(pc_data_gland1, 
+               aes(UMAP_1, UMAP_2)) +
+                geom_point(aes_string(color=pc), 
+                           alpha = 0.7) +
+                scale_color_gradient(guide = FALSE, 
+                                     low = "grey90", 
+                                     high = "blue")  +
+                geom_text(data=umap_label_gland1, 
+                          aes(label=ident, x, y)) +
+                ggtitle(pc)
+}) %>% 
+        plot_grid(plotlist = .)
+#saved as gland1_pcplots_umap_020124
+
+DimPlot(gland1, reduction = "pca", label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5))
+
+stdev_gland1 <- Stdev(gland1, reduction = "pca")
+
+pca_gland1 <- pc_data_gland1
+pca_gland1$sym_state <- gland1@meta.data$condition
+summary(aov(PC_1 ~ sym_state, data = pca_gland1)) #0.23
+summary(aov(PC_2 ~ sym_state, data = pca_gland1)) #0.635
+summary(aov(PC_3 ~ sym_state, data = pca_gland1)) #0.0653 .
+summary(aov(PC_4 ~ sym_state, data = pca_gland1)) #0.041 *
+summary(aov(PC_5 ~ sym_state, data = pca_gland1)) #0.351                               
+summary(aov(PC_6 ~ sym_state, data = pca_gland1)) #0.901
+summary(aov(PC_7 ~ sym_state, data = pca_gland1)) #0.092 .
+summary(aov(PC_8 ~ sym_state, data = pca_gland1)) #0.754
+summary(aov(PC_9 ~ sym_state, data = pca_gland1)) #0.26
+summary(aov(PC_10 ~ sym_state, data = pca_gland1)) #0.0323 *
+
+#going to look at 4 and 10, nothing very strong
+adonis2(pca_gland1[,c(4,10)] ~ sym_state, data = pca_gland1[c(4,10,14)], method='eu', na.rm = TRUE)
+#           Df SumOfSqs      R2     F Pr(>F)   
+# sym_state   1    453.3 0.02521 4.3704  0.001 ***
+# Residual  169  17527.8 0.97479                  
+# Total     170  17981.0 1.00000       
+
+li_gland1 <- stdev_gland1^2 / sum(stdev_gland1^2)
+pc4v_gland1 <- round(li_gland1[4] * 100, 1) #5.4 of variance
+pc10v_gland1 <- round(li_gland1[10] * 100, 1) #2.4 of variance
+
+gland1_pc4.10 <- DimPlot(gland1, reduction = "pca", dims = c(4, 10), label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + xlab(paste0("PC4: ",pc4v_gland1,"% variance")) + ylab(paste0("PC10: ", pc10v_gland1, "% variance"))
+#saved as gland1_pc4_pc10_020124 with 5x4.5 dims
+
+print(gland1[["pca"]], dims = 1:10, nfeatures = 10)
+#PC_ 4 
+#Positive: WNT7B.3, ADRB2.86, YIPF3, NEIL1, LIPR1.2, ZNRF3, EVM.20prediction.20chromosome.9.2360, CQ105, WNT16, SFRP3 
+#Negative:  DNJA2, RASA1.1, DPOLL, E2AK4, EEA1, EVM.20prediction.20chromosome.7.485, EVM.20prediction.20chromosome.13.1933, PRAG1, PANP, SAPC2   
+
+#PC_ 10 
+#Positive: VEGFC, PRP17, SH319.1, ZHANG, TRPM1, GABR2.8, PCF5A, INT6, FXJ1B, PAR14.16 
+#Negative:  CNPY4.1, YTX2.174, FBX11, EVM.20prediction.20chromosome.10.2809, TBD2B, EVM.20prediction.20chromosome.12.2605, ROAA, ELK1.2, EVM.20prediction.20chromosome.12.3258, EVM.20prediction.20chromosome.7.2828 
+
+
+DefaultAssay(gland1) <- "RNA"
+gland1[["RNA"]]@counts<-as.matrix(gland1[["RNA"]]@counts)+1
+
+
+gland1_mark <- FindMarkers(gland1, ident.1 = "sym", ident.2="apo", group.by = "condition", test.use="DESeq2", slot = "counts")
+head(gland1_mark)
+#pretty sure in this case neg lfc means down in sym; pos lfc means up in sym
+gland1_mark <- rownames_to_column(gland1_mark, var="gene_symbol")
+
+gland1_pc4_feat <- c("WNT7B.3", "ADRB2.86", "YIPF3", "NEIL1", "LIPR1.2", "ZNRF3", "EVM.20prediction.20chromosome.9.2360", "CQ105", "WNT16", "SFRP3", "DNJA2", "RASA1.1", "DPOLL", "E2AK4", "EEA1", "EVM.20prediction.20chromosome.7.485", "EVM.20prediction.20chromosome.13.1933", "PRAG1", "PANP", "SAPC2")
+
+gland1_pc10_feat <- c("VEGFC", "PRP17", "SH319.1", "ZHANG", "TRPM1", "GABR2.8", "PCF5A", "INT6", "FXJ1B", "PAR14.16", "CNPY4.1", "YTX2.174", "FBX11", "EVM.20prediction.20chromosome.10.2809", "TBD2B", "EVM.20prediction.20chromosome.12.2605", "ROAA", "ELK1.2", "EVM.20prediction.20chromosome.12.3258", "EVM.20prediction.20chromosome.7.2828")
+
+
+#visualize the pc6 features in barplot
+gland1_pc4_mark <- subset(gland1_mark, gene_symbol %in% gland1_pc4_feat)
+# add a column of NAs
+gland1_pc4_mark$diffexpressed <- "ns"
+# if log2Foldchange > 0 set as "SYM"
+gland1_pc4_mark$diffexpressed[gland1_pc4_mark$avg_log2FC > 0] <- "SYM"
+# if log2Foldchange < 0 set as "APO"
+gland1_pc4_mark$diffexpressed[gland1_pc4_mark$avg_log2FC < 0] <- "APO"
+
+gland1_pc4_bar <- ggplot(data=gland1_pc4_mark, aes(y=gene_symbol, x=avg_log2FC, fill=diffexpressed)) +
+  geom_bar(position="stack", stat="identity", color="black", alpha=0.6)+
+  scale_fill_manual(values=c("gray40", "#CC6600"))+
+  theme_classic()
+##saved as gland1_pc4_barplot as landscape 8x5
+
+#visualize the pc10 features in barplot
+gland1_pc10_mark <- subset(gland1_mark, gene_symbol %in% gland1_pc10_feat)
+# add a column of NAs
+gland1_pc10_mark$diffexpressed <- "ns"
+# if log2Foldchange > 0 set as "SYM"
+gland1_pc10_mark$diffexpressed[gland1_pc10_mark$avg_log2FC > 0] <- "SYM"
+# if log2Foldchange < 0 set as "APO"
+gland1_pc10_mark$diffexpressed[gland1_pc10_mark$avg_log2FC < 0] <- "APO"
+gland1_pc10_bar <- ggplot(data=gland1_pc10_mark, aes(y=gene_symbol, x=avg_log2FC, fill=diffexpressed)) +
+  geom_bar(position="stack", stat="identity", color="black", alpha=0.6)+
+  scale_fill_manual(values=c("gray40", "#CC6600"))+
+  theme_classic()
+##saved as gland1_pc10_barplot as 8x5 landscape
+```
+
+Look at subcluster marker genes
+```{r}
+gland1_markers_subclust <- FindAllMarkers(gland1, 
+                          min.pct = -Inf, 
+                          logfc.threshold = .5, 
+                          only.pos = T, 
+                          test.use = "MAST",
+                          latent.vars = c('percent.mt', 'nFeature_RNA'))
+
+gland1_markers_subclust
+#only 2 has markers
+```
+
+#Gland 2
+```{r}
+gland2 <- subset(oculina_named_h, idents = "Gland 2") 
+
+gland2 <- FindVariableFeatures(gland2, selection.method = "vst")
+gland2 <- ScaleData(gland2, verbose = FALSE, assay="RNA")
+gland2 <- RunPCA(gland2)
+gland2 <- RunUMAP(gland2, reduction="pca", dims=1:30, return.model=TRUE)
+gland2 <- FindNeighbors(gland2, reduction ="pca", dims=1:30)
+
+gland2 <- FindClusters(gland2, resolution = 0.25)
+#1
+
+gland2@meta.data$seurat_clusters <- as.numeric(as.character(gland2@meta.data$seurat_clusters))+1
+Idents(gland2)<- "seurat_clusters"
+gland2$seurat_clusters
+gland2@active.ident <- factor(x = gland2@active.ident, levels = 1)
+gland2@active.ident
+
+plot17 <- DimPlot(gland2, reduction = "umap", label = T)
+plot18 <- DimPlot(gland2, reduction = "umap", label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + ggtitle("") + theme(legend.text=element_text(size=10))
+#umap_gland2_plot17plot18 10x4
+```
+
+```{r}
+gland2_topfeat <- TopFeatures(object = gland2[["pca"]], dim = 1, nfeatures = 20, balanced = TRUE)
+gland2[["umap"]]@cell.embeddings
+columns <- c(paste0("PC_", 1:10),
+            "ident",
+            "UMAP_1", "UMAP_2")
+pc_data_gland2 <- FetchData(gland2, 
+                     vars = columns)
+# Adding cluster label to center of cluster on UMAP
+umap_label_gland2 <- FetchData(gland2, 
+  vars = c("ident", "UMAP_1", "UMAP_2"))  %>%
+  group_by(ident) %>%
+  summarise(x=mean(UMAP_1), y=mean(UMAP_2))
+# Plotting a UMAP plot for each of the PCs
+
+map(paste0("PC_", 1:10), function(pc){
+        ggplot(pc_data_gland2, 
+               aes(UMAP_1, UMAP_2)) +
+                geom_point(aes_string(color=pc), 
+                           alpha = 0.7) +
+                scale_color_gradient(guide = FALSE, 
+                                     low = "grey90", 
+                                     high = "blue")  +
+                geom_text(data=umap_label_gland2, 
+                          aes(label=ident, x, y)) +
+                ggtitle(pc)
+}) %>% 
+        plot_grid(plotlist = .)
+#saved as gland2_pcplots_umap_020124
+
+DimPlot(gland2, reduction = "pca", label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5))
+
+stdev_gland2 <- Stdev(gland2, reduction = "pca")
+
+pca_gland2 <- pc_data_gland2
+pca_gland2$sym_state <- gland2@meta.data$condition
+summary(aov(PC_1 ~ sym_state, data = pca_gland2)) #0.764
+summary(aov(PC_2 ~ sym_state, data = pca_gland2)) #0.228
+summary(aov(PC_3 ~ sym_state, data = pca_gland2)) #0.213
+summary(aov(PC_4 ~ sym_state, data = pca_gland2)) #0.711
+summary(aov(PC_5 ~ sym_state, data = pca_gland2)) #0.302                              
+summary(aov(PC_6 ~ sym_state, data = pca_gland2)) #0.0939 .
+summary(aov(PC_7 ~ sym_state, data = pca_gland2)) #0.204
+summary(aov(PC_8 ~ sym_state, data = pca_gland2)) #0.744
+summary(aov(PC_9 ~ sym_state, data = pca_gland2)) #0.357
+summary(aov(PC_10 ~ sym_state, data = pca_gland2)) #0.7
+
+#nothing that is sig
+
+li_gland2 <- stdev_gland2^2 / sum(stdev_gland2^2)
+
+DefaultAssay(gland2) <- "RNA"
+gland2[["RNA"]]@counts<-as.matrix(gland2[["RNA"]]@counts)+1
+
+gland2_mark <- FindMarkers(gland2, ident.1 = "sym", ident.2="apo", group.by = "condition", test.use="DESeq2", slot = "counts")
+head(gland2_mark)
+#pretty sure in this case neg lfc means down in sym; pos lfc means up in sym
+gland2_mark <- rownames_to_column(gland2_mark, var="gene_symbol")
+```
+
+#Gland 3
+```{r}
+gland3 <- subset(oculina_named_h, idents = "Gland 3") 
+
+gland3 <- FindVariableFeatures(gland3, selection.method = "vst")
+gland3 <- ScaleData(gland3, verbose = FALSE, assay="RNA")
+gland3 <- RunPCA(gland3)
+gland3 <- RunUMAP(gland3, reduction="pca", dims=1:30, return.model=TRUE)
+gland3 <- FindNeighbors(gland3, reduction ="pca", dims=1:30)
+
+gland3 <- FindClusters(gland3, resolution = 0.25)
+#2
+
+gland3@meta.data$seurat_clusters <- as.numeric(as.character(gland3@meta.data$seurat_clusters))+1
+Idents(gland3)<- "seurat_clusters"
+gland3$seurat_clusters
+gland3@active.ident <- factor(x = gland3@active.ident, levels = 1:2)
+gland3@active.ident
+
+plot19 <- DimPlot(gland3, reduction = "umap", label = T)
+plot20 <- DimPlot(gland3, reduction = "umap", label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + ggtitle("") + theme(legend.text=element_text(size=10))
+#umap_gland3_plot19plot20 10x4
+```
+
+```{r}
+gland3_topfeat <- TopFeatures(object = gland3[["pca"]], dim = 1, nfeatures = 20, balanced = TRUE)
+gland3[["umap"]]@cell.embeddings
+columns <- c(paste0("PC_", 1:10),
+            "ident",
+            "UMAP_1", "UMAP_2")
+pc_data_gland3 <- FetchData(gland3, 
+                     vars = columns)
+# Adding cluster label to center of cluster on UMAP
+umap_label_gland3 <- FetchData(gland3, 
+  vars = c("ident", "UMAP_1", "UMAP_2"))  %>%
+  group_by(ident) %>%
+  summarise(x=mean(UMAP_1), y=mean(UMAP_2))
+# Plotting a UMAP plot for each of the PCs
+
+map(paste0("PC_", 1:10), function(pc){
+        ggplot(pc_data_gland3, 
+               aes(UMAP_1, UMAP_2)) +
+                geom_point(aes_string(color=pc), 
+                           alpha = 0.7) +
+                scale_color_gradient(guide = FALSE, 
+                                     low = "grey90", 
+                                     high = "blue")  +
+                geom_text(data=umap_label_gland3, 
+                          aes(label=ident, x, y)) +
+                ggtitle(pc)
+}) %>% 
+        plot_grid(plotlist = .)
+#saved as gland3_pcplots_umap_020124
+
+DimPlot(gland3, reduction = "pca", label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5))
+
+stdev_gland3 <- Stdev(gland3, reduction = "pca")
+
+pca_gland3 <- pc_data_gland3
+pca_gland3$sym_state <- gland3@meta.data$condition
+summary(aov(PC_1 ~ sym_state, data = pca_gland3)) #0.0757 .
+summary(aov(PC_2 ~ sym_state, data = pca_gland3)) #0.453
+summary(aov(PC_3 ~ sym_state, data = pca_gland3)) #0.731
+summary(aov(PC_4 ~ sym_state, data = pca_gland3)) #0.609
+summary(aov(PC_5 ~ sym_state, data = pca_gland3)) #0.675                             
+summary(aov(PC_6 ~ sym_state, data = pca_gland3)) #0.478
+summary(aov(PC_7 ~ sym_state, data = pca_gland3)) #0.785
+summary(aov(PC_8 ~ sym_state, data = pca_gland3)) #0.862
+summary(aov(PC_9 ~ sym_state, data = pca_gland3)) #0.281
+summary(aov(PC_10 ~ sym_state, data = pca_gland3)) #0.123
+
+#nothing sig
+
+li_gland3 <- stdev_gland3^2 / sum(stdev_gland3^2)
+
+DefaultAssay(gland3) <- "RNA"
+gland3[["RNA"]]@counts<-as.matrix(gland3[["RNA"]]@counts)+1
+
+gland3_mark <- FindMarkers(gland3, ident.1 = "sym", ident.2="apo", group.by = "condition", test.use="DESeq2", slot = "counts")
+head(gland3_mark)
+#pretty sure in this case neg lfc means down in sym; pos lfc means up in sym
+gland3_mark <- rownames_to_column(gland3_mark, var="gene_symbol")
+```
+
+Look at subcluster marker genes
+```{r}
+gland3_markers_subclust <- FindAllMarkers(gland3, 
+                          min.pct = -Inf, 
+                          logfc.threshold = .5, 
+                          only.pos = T, 
+                          test.use = "MAST",
+                          latent.vars = c('percent.mt', 'nFeature_RNA'))
+
+gland3_markers_subclust
+#only 2 has markers
+```
+
+#Gland 4
+```{r}
+gland4 <- subset(oculina_named_h, idents = "Gland 4") 
+
+gland4 <- FindVariableFeatures(gland4, selection.method = "vst")
+gland4 <- ScaleData(gland4, verbose = FALSE, assay="RNA")
+gland4 <- RunPCA(gland4)
+gland4 <- RunUMAP(gland4, reduction="pca", dims=1:30, return.model=TRUE)
+gland4 <- FindNeighbors(gland4, reduction ="pca", dims=1:30)
+
+gland4 <- FindClusters(gland4, resolution = 0.25)
+#2
+
+gland4@meta.data$seurat_clusters <- as.numeric(as.character(gland4@meta.data$seurat_clusters))+1
+Idents(gland4)<- "seurat_clusters"
+gland4$seurat_clusters
+gland4@active.ident <- factor(x = gland4@active.ident, levels = 1:2)
+gland4@active.ident
+
+plot21 <- DimPlot(gland4, reduction = "umap", label = T)
+plot22 <- DimPlot(gland4, reduction = "umap", label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + ggtitle("") + theme(legend.text=element_text(size=10))
+#umap_gland4_plot21plot22 10x4
+```
+
+```{r}
+gland4_topfeat <- TopFeatures(object = gland4[["pca"]], dim = 1, nfeatures = 20, balanced = TRUE)
+gland4[["umap"]]@cell.embeddings
+columns <- c(paste0("PC_", 1:10),
+            "ident",
+            "UMAP_1", "UMAP_2")
+pc_data_gland4 <- FetchData(gland4, 
+                     vars = columns)
+# Adding cluster label to center of cluster on UMAP
+umap_label_gland4 <- FetchData(gland4, 
+  vars = c("ident", "UMAP_1", "UMAP_2"))  %>%
+  group_by(ident) %>%
+  summarise(x=mean(UMAP_1), y=mean(UMAP_2))
+# Plotting a UMAP plot for each of the PCs
+
+map(paste0("PC_", 1:10), function(pc){
+        ggplot(pc_data_gland4, 
+               aes(UMAP_1, UMAP_2)) +
+                geom_point(aes_string(color=pc), 
+                           alpha = 0.7) +
+                scale_color_gradient(guide = FALSE, 
+                                     low = "grey90", 
+                                     high = "blue")  +
+                geom_text(data=umap_label_gland4, 
+                          aes(label=ident, x, y)) +
+                ggtitle(pc)
+}) %>% 
+        plot_grid(plotlist = .)
+#saved as gland4_pcplots_umap_020224
+
+DimPlot(gland4, reduction = "pca", label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5))
+
+stdev_gland4 <- Stdev(gland4, reduction = "pca")
+
+pca_gland4 <- pc_data_gland4
+pca_gland4$sym_state <- gland4@meta.data$condition
+summary(aov(PC_1 ~ sym_state, data = pca_gland4)) #0.471
+summary(aov(PC_2 ~ sym_state, data = pca_gland4)) #0.0474 *
+summary(aov(PC_3 ~ sym_state, data = pca_gland4)) #0.186
+summary(aov(PC_4 ~ sym_state, data = pca_gland4)) #0.531
+summary(aov(PC_5 ~ sym_state, data = pca_gland4)) #0.406                            
+summary(aov(PC_6 ~ sym_state, data = pca_gland4)) #0.0716 .
+summary(aov(PC_7 ~ sym_state, data = pca_gland4)) #0.825
+summary(aov(PC_8 ~ sym_state, data = pca_gland4)) #0.162
+summary(aov(PC_9 ~ sym_state, data = pca_gland4)) #0.363
+summary(aov(PC_10 ~ sym_state, data = pca_gland4)) #0.562
+
+#Check 2 and 6 (even tho not very sig)
+
+adonis2(pca_gland4[,c(2,6)] ~ sym_state, data = pca_gland4[c(2,6,14)], method='eu', na.rm = TRUE)
+#           Df SumOfSqs      R2     F Pr(>F)   
+# sym_state   1    677.3 0.06743 3.8322  0.002 **
+#Residual  53   9366.8 0.93257                 
+#Total     54  10044.1 1.00000
+
+li_gland4 <- stdev_gland4^2 / sum(stdev_gland4^2)
+pc2v_gland4 <- round(li_gland4[2] * 100, 1) #5.8 of variance
+pc6v_gland4 <- round(li_gland4[6] * 100, 1) #3.7 of variance
+
+gland4_pc2.6 <- DimPlot(gland4, reduction = "pca", dims = c(2, 6), label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + xlab(paste0("PC2: ",pc2v_gland4,"% variance")) + ylab(paste0("PC6: ", pc6v_gland4, "% variance"))
+#saved as gland4_pc2_pc6_020224 with 5x4.5 dims
+
+print(gland4[["pca"]], dims = 1:10, nfeatures = 10)
+#PC_ 2 
+#Positive: EVM.20prediction.20chromosome.13.1247, EVM.20prediction.20chromosome.6.47, AGRE1.4, EVM.20prediction.20chromosome.4.268, CALM.6, EVM.20prediction.20chromosome.5.1872, EVM.20prediction.20chromosome.10.1787, EVM.20prediction.20chromosome.6.2897, EVM.20prediction.20chromosome.6.1348, EVM.20prediction.20chromosome.6.2340 
+#Negative:  TRAF3.10, EVM.20prediction.20chromosome.10.1882, EVM.20prediction.20chromosome.10.2221, TRAD1.1, ALPS.1, EVM.20prediction.20chromosome.11.2935, HSP16, H3.16, EVM.20prediction.20chromosome.10.1880, H10.2
+
+#PC_ 6 
+#Positive: NDUV2.1, NOTCH, EVM.20prediction.20chromosome.7.562, NEK10, LMTK1, VATB, CC178, VAMP7, ISY1, UBXN4.1 
+#Negative:  EVM.20prediction.20chromosome.5.430, TPM.1, EVM.20prediction.20chromosome.8.2202, EVM.20prediction.20chromosome.4.49, EVM.20prediction.20chromosome.14.829, HES4A.2, TRFM.1, CAHZ, LTOR3, P85AA 
+
+DefaultAssay(gland4) <- "RNA"
+gland4[["RNA"]]@counts<-as.matrix(gland4[["RNA"]]@counts)+1
+
+gland4_mark <- FindMarkers(gland4, ident.1 = "sym", ident.2="apo", group.by = "condition", test.use="DESeq2", slot = "counts")
+head(gland4_mark)
+#pretty sure in this case neg lfc means down in sym; pos lfc means up in sym
+gland4_mark <- rownames_to_column(gland4_mark, var="gene_symbol")
+
+gland4_pc2_feat <- c("EVM.20prediction.20chromosome.13.1247", "EVM.20prediction.20chromosome.6.47", "AGRE1.4", "EVM.20prediction.20chromosome.4.268", "CALM.6", "EVM.20prediction.20chromosome.5.1872", "EVM.20prediction.20chromosome.10.1787", "EVM.20prediction.20chromosome.6.2897", "EVM.20prediction.20chromosome.6.1348", "EVM.20prediction.20chromosome.6.2340", "TRAF3.10", "EVM.20prediction.20chromosome.10.1882", "EVM.20prediction.20chromosome.10.2221", "TRAD1.1", "ALPS.1", "EVM.20prediction.20chromosome.11.2935", "HSP16", "H3.16", "EVM.20prediction.20chromosome.10.1880", "H10.2")
+
+gland4_pc6_feat <- c("NDUV2.1", "NOTCH", "EVM.20prediction.20chromosome.7.562", "NEK10", "LMTK1", "VATB", "CC178", "VAMP7", "ISY1", "UBXN4.1", "EVM.20prediction.20chromosome.5.430", "TPM.1", "EVM.20prediction.20chromosome.8.2202", "EVM.20prediction.20chromosome.4.49", "EVM.20prediction.20chromosome.14.829", "HES4A.2", "TRFM.1", "CAHZ", "LTOR3", "P85AA")
+
+
+#visualize the pc2 features in barplot
+gland4_pc2_mark <- subset(gland4_mark, gene_symbol %in% gland4_pc2_feat)
+# add a column of NAs
+gland4_pc2_mark$diffexpressed <- "ns"
+# if log2Foldchange > 0 set as "SYM"
+gland4_pc2_mark$diffexpressed[gland4_pc2_mark$avg_log2FC > 0] <- "SYM"
+# if log2Foldchange < 0 set as "APO"
+gland4_pc2_mark$diffexpressed[gland4_pc2_mark$avg_log2FC < 0] <- "APO"
+
+gland4_pc2_bar <- ggplot(data=gland4_pc2_mark, aes(y=gene_symbol, x=avg_log2FC, fill=diffexpressed)) +
+  geom_bar(position="stack", stat="identity", color="black", alpha=0.6)+
+  scale_fill_manual(values=c("gray40", "#CC6600"))+
+  theme_classic()
+##saved as gland4_pc2_barplot as landscape 8x5
+
+#visualize the pc6 features in barplot
+gland4_pc6_mark <- subset(gland4_mark, gene_symbol %in% gland4_pc6_feat)
+# add a column of NAs
+gland4_pc6_mark$diffexpressed <- "ns"
+# if log2Foldchange > 0 set as "SYM"
+gland4_pc6_mark$diffexpressed[gland4_pc6_mark$avg_log2FC > 0] <- "SYM"
+# if log2Foldchange < 0 set as "APO"
+gland4_pc6_mark$diffexpressed[gland4_pc6_mark$avg_log2FC < 0] <- "APO"
+gland4_pc6_bar <- ggplot(data=gland4_pc6_mark, aes(y=gene_symbol, x=avg_log2FC, fill=diffexpressed)) +
+  geom_bar(position="stack", stat="identity", color="black", alpha=0.6)+
+  scale_fill_manual(values=c("gray40", "#CC6600"))+
+  theme_classic()
+##saved as gland4_pc6_barplot as 8x5 landscape
+```
+
+Can't look at subcluster marker genes bc subcluster 2 only has 2 cells
+
+#Gland 5
+```{r}
+gland5 <- subset(oculina_named_h, idents = "Gland 5") 
+
+gland5 <- FindVariableFeatures(gland5, selection.method = "vst")
+gland5 <- ScaleData(gland5, verbose = FALSE, assay="RNA")
+gland5 <- RunPCA(gland5)
+gland5 <- RunUMAP(gland5, reduction="pca", dims=1:30, return.model=TRUE)
+gland5 <- FindNeighbors(gland5, reduction ="pca", dims=1:30)
+
+gland5 <- FindClusters(gland5, resolution = 0.25)
+#1
+
+gland5@meta.data$seurat_clusters <- as.numeric(as.character(gland5@meta.data$seurat_clusters))+1
+Idents(gland5)<- "seurat_clusters"
+gland5$seurat_clusters
+gland5@active.ident <- factor(x = gland5@active.ident, levels = 1)
+gland5@active.ident
+
+plot23 <- DimPlot(gland5, reduction = "umap", label = T)
+plot24 <- DimPlot(gland5, reduction = "umap", label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + ggtitle("") + theme(legend.text=element_text(size=10))
+#umap_gland5_plot23plot24 10x4
+```
+
+```{r}
+gland5_topfeat <- TopFeatures(object = gland5[["pca"]], dim = 1, nfeatures = 20, balanced = TRUE)
+gland5[["umap"]]@cell.embeddings
+columns <- c(paste0("PC_", 1:10),
+            "ident",
+            "UMAP_1", "UMAP_2")
+pc_data_gland5 <- FetchData(gland5, 
+                     vars = columns)
+# Adding cluster label to center of cluster on UMAP
+umap_label_gland5 <- FetchData(gland5, 
+  vars = c("ident", "UMAP_1", "UMAP_2"))  %>%
+  group_by(ident) %>%
+  summarise(x=mean(UMAP_1), y=mean(UMAP_2))
+# Plotting a UMAP plot for each of the PCs
+
+map(paste0("PC_", 1:10), function(pc){
+        ggplot(pc_data_gland5, 
+               aes(UMAP_1, UMAP_2)) +
+                geom_point(aes_string(color=pc), 
+                           alpha = 0.7) +
+                scale_color_gradient(guide = FALSE, 
+                                     low = "grey90", 
+                                     high = "blue")  +
+                geom_text(data=umap_label_gland5, 
+                          aes(label=ident, x, y)) +
+                ggtitle(pc)
+}) %>% 
+        plot_grid(plotlist = .)
+#saved as gland5_pcplots_umap_020224
+
+DimPlot(gland5, reduction = "pca", label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5))
+
+stdev_gland5 <- Stdev(gland5, reduction = "pca")
+
+pca_gland5 <- pc_data_gland5
+pca_gland5$sym_state <- gland5@meta.data$condition
+summary(aov(PC_1 ~ sym_state, data = pca_gland5)) #0.368
+summary(aov(PC_2 ~ sym_state, data = pca_gland5)) #0.243
+summary(aov(PC_3 ~ sym_state, data = pca_gland5)) #1
+summary(aov(PC_4 ~ sym_state, data = pca_gland5)) #0.178
+summary(aov(PC_5 ~ sym_state, data = pca_gland5)) #0.822                            
+summary(aov(PC_6 ~ sym_state, data = pca_gland5)) #0.0776 .
+summary(aov(PC_7 ~ sym_state, data = pca_gland5)) #0.506
+summary(aov(PC_8 ~ sym_state, data = pca_gland5)) #0.454
+summary(aov(PC_9 ~ sym_state, data = pca_gland5)) #0.68
+summary(aov(PC_10 ~ sym_state, data = pca_gland5)) #0.386
+
+#no sig
+
+li_gland5 <- stdev_gland5^2 / sum(stdev_gland5^2)
+
+DefaultAssay(gland5) <- "RNA"
+gland5[["RNA"]]@counts<-as.matrix(gland5[["RNA"]]@counts)+1
+
+gland5_mark <- FindMarkers(gland5, ident.1 = "sym", ident.2="apo", group.by = "condition", test.use="DESeq2", slot = "counts")
+head(gland5_mark)
+#pretty sure in this case neg lfc means down in sym; pos lfc means up in sym
+gland5_mark <- rownames_to_column(gland5_mark, var="gene_symbol")
+```
+
+#Neuron 1
+```{r}
+neuron1 <- subset(oculina_named_h, idents = "Neuron 1") 
+
+n1 <- FindVariableFeatures(neuron1, selection.method = "vst")
+n1 <- ScaleData(n1, verbose = FALSE, assay="RNA")
+n1 <- RunPCA(n1)
+n1 <- RunUMAP(n1, reduction="pca", dims=1:30, return.model=TRUE)
+n1 <- FindNeighbors(n1, reduction ="pca", dims=1:30)
+
+n1 <- FindClusters(n1, resolution = 0.25)
+#9
+
+n1@meta.data$seurat_clusters <- as.numeric(as.character(n1@meta.data$seurat_clusters))+1
+Idents(n1)<- "seurat_clusters"
+n1$seurat_clusters
+n1@active.ident <- factor(x = n1@active.ident, levels = 1:9)
+n1@active.ident
+
+plot25 <- DimPlot(n1, reduction = "umap", label = T)
+plot26 <- DimPlot(n1, reduction = "umap", label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + ggtitle("") + theme(legend.text=element_text(size=10))
+#umap_neuron1_plot25plot26 10x4
+```
+
+```{r}
+n1_topfeat <- TopFeatures(object = n1[["pca"]], dim = 1, nfeatures = 20, balanced = TRUE)
+n1[["umap"]]@cell.embeddings
+columns <- c(paste0("PC_", 1:10),
+            "ident",
+            "UMAP_1", "UMAP_2")
+pc_data_n1 <- FetchData(n1, 
+                     vars = columns)
+# Adding cluster label to center of cluster on UMAP
+umap_label_n1 <- FetchData(n1, 
+  vars = c("ident", "UMAP_1", "UMAP_2"))  %>%
+  group_by(ident) %>%
+  summarise(x=mean(UMAP_1), y=mean(UMAP_2))
+# Plotting a UMAP plot for each of the PCs
+
+map(paste0("PC_", 1:10), function(pc){
+        ggplot(pc_data_n1, 
+               aes(UMAP_1, UMAP_2)) +
+                geom_point(aes_string(color=pc), 
+                           alpha = 0.7) +
+                scale_color_gradient(guide = FALSE, 
+                                     low = "grey90", 
+                                     high = "blue")  +
+                geom_text(data=umap_label_n1, 
+                          aes(label=ident, x, y)) +
+                ggtitle(pc)
+}) %>% 
+        plot_grid(plotlist = .)
+#saved as n1_pcplots_umap_020224
+
+DimPlot(n1, reduction = "pca", label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5))
+
+stdev_n1 <- Stdev(n1, reduction = "pca")
+
+pca_n1 <- pc_data_n1
+pca_n1$sym_state <- n1@meta.data$condition
+summary(aov(PC_1 ~ sym_state, data = pca_n1)) #0.219
+summary(aov(PC_2 ~ sym_state, data = pca_n1)) #0.0515 .
+summary(aov(PC_3 ~ sym_state, data = pca_n1)) #0.575
+summary(aov(PC_4 ~ sym_state, data = pca_n1)) #0.00118 **
+summary(aov(PC_5 ~ sym_state, data = pca_n1)) #0.429                           
+summary(aov(PC_6 ~ sym_state, data = pca_n1)) #0.491
+summary(aov(PC_7 ~ sym_state, data = pca_n1)) #0.793
+summary(aov(PC_8 ~ sym_state, data = pca_n1)) #0.0346 *
+summary(aov(PC_9 ~ sym_state, data = pca_n1)) #0.72
+summary(aov(PC_10 ~ sym_state, data = pca_n1)) #0.753
+
+#Check 4 and 7 (even tho not very sig)
+
+adonis2(pca_n1[,c(4,7)] ~ sym_state, data = pca_n1[c(4,7,14)], method='eu', na.rm = TRUE)
+#           Df SumOfSqs      R2     F Pr(>F)   
+# sym_state   1    151.1 0.00652 6.0896  0.006 **
+#Residual  928  23028.2 0.99348                 
+#Total     929  23179.4 1.00000 
+
+li_n1 <- stdev_n1^2 / sum(stdev_n1^2)
+pc4v_n1 <- round(li_n1[4] * 100, 1) #4 of variance
+pc7v_n1 <- round(li_n1[7] * 100, 1) #2.9 of variance
+
+n1_pc4.7 <- DimPlot(n1, reduction = "pca", dims = c(4, 7), label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + xlab(paste0("PC4: ",pc4v_n1,"% variance")) + ylab(paste0("PC7: ", pc7v_n1, "% variance"))
+#saved as n1_pc4_pc7_020224 with 5x4.5 dims
+
+print(n1[["pca"]], dims = 1:10, nfeatures = 10)
+#PC_ 4 
+#Positive: CO4A1.2, CMLO2.3, CO3, CRA1B.3, EVM.20prediction.20chromosome.4.1613, CATL.8, EPDR1.1, EVM.20prediction.20chromosome.4.1067, EVM.20prediction.20chromosome.11.1132, CALM.20 
+#Negative:  MSRE, MUC19, NAS13, KCP.1, EVM.20prediction.20chromosome.9.2752, CSP.1, EVM.20prediction.20chromosome.14.4975, EVM.20prediction.20chromosome.4.475, COCA1.3, EVM.20prediction.20chromosome.7.472
+
+#PC_ 7 
+#Positive: MLRP1.6, MUC1.9, GELS2.2, ACT, EVM.20prediction.20chromosome.12.3636, GRIA2.2, SAAR2.3, PLCL, PK1L2.7, EVM.20prediction.20chromosome.11.3133 
+#Negative:  EVM.20prediction.20chromosome.14.4830, INCEA, IQCE.1, TITIN.4, Y4HQ, TBA1A, ADT.1, EVM.20prediction.20chromosome.4.1220, EVM.20prediction.20chromosome.5.1771, TBB 
+
+DefaultAssay(n1) <- "RNA"
+n1[["RNA"]]@counts<-as.matrix(n1[["RNA"]]@counts)+1
+
+n1_mark <- FindMarkers(n1, ident.1 = "sym", ident.2="apo", group.by = "condition", test.use="DESeq2", slot = "counts")
+head(n1_mark)
+#pretty sure in this case neg lfc means down in sym; pos lfc means up in sym
+n1_mark <- rownames_to_column(n1_mark, var="gene_symbol")
+
+n1_pc4_feat <- c("CO4A1.2", "CMLO2.3", "CO3", "CRA1B.3", "EVM.20prediction.20chromosome.4.1613", "CATL.8", "EPDR1.1", "EVM.20prediction.20chromosome.4.1067", "EVM.20prediction.20chromosome.11.1132", "CALM.20", "MSRE", "MUC19", "NAS13", "KCP.1", "EVM.20prediction.20chromosome.9.2752", "CSP.1", "EVM.20prediction.20chromosome.14.4975", "EVM.20prediction.20chromosome.4.475, COCA1.3", "EVM.20prediction.20chromosome.7.472")
+
+n1_pc7_feat <- c("MLRP1.6", "MUC1.9", "GELS2.2", "ACT", "EVM.20prediction.20chromosome.12.3636", "GRIA2.2", "SAAR2.3", "PLCL", "PK1L2.7", "EVM.20prediction.20chromosome.11.3133", "EVM.20prediction.20chromosome.14.4830", "INCEA", "IQCE.1", "TITIN.4", "Y4HQ", "TBA1A", "ADT.1", "EVM.20prediction.20chromosome.4.1220", "EVM.20prediction.20chromosome.5.1771", "TBB")
+
+
+#visualize the pc4 features in barplot
+n1_pc4_mark <- subset(n1_mark, gene_symbol %in% n1_pc4_feat)
+# add a column of NAs
+n1_pc4_mark$diffexpressed <- "ns"
+# if log2Foldchange > 0 set as "SYM"
+n1_pc4_mark$diffexpressed[n1_pc4_mark$avg_log2FC > 0] <- "SYM"
+# if log2Foldchange < 0 set as "APO"
+n1_pc4_mark$diffexpressed[n1_pc4_mark$avg_log2FC < 0] <- "APO"
+
+n1_pc4_bar <- ggplot(data=n1_pc4_mark, aes(y=gene_symbol, x=avg_log2FC, fill=diffexpressed)) +
+  geom_bar(position="stack", stat="identity", color="black", alpha=0.6)+
+  scale_fill_manual(values=c("gray40", "#CC6600"))+
+  theme_classic()
+##saved as n1_pc4_barplot as landscape 8x5
+
+#visualize the pc7 features in barplot
+n1_pc7_mark <- subset(n1_mark, gene_symbol %in% n1_pc7_feat)
+# add a column of NAs
+n1_pc7_mark$diffexpressed <- "ns"
+# if log2Foldchange > 0 set as "SYM"
+n1_pc7_mark$diffexpressed[n1_pc7_mark$avg_log2FC > 0] <- "SYM"
+# if log2Foldchange < 0 set as "APO"
+n1_pc7_mark$diffexpressed[n1_pc7_mark$avg_log2FC < 0] <- "APO"
+n1_pc7_bar <- ggplot(data=n1_pc7_mark, aes(y=gene_symbol, x=avg_log2FC, fill=diffexpressed)) +
+  geom_bar(position="stack", stat="identity", color="black", alpha=0.6)+
+  scale_fill_manual(values=c("gray40", "#CC6600"))+
+  theme_classic()
+##saved as n1_pc7_barplot as 8x5 landscape
+```
+
+Look at subcluster marker genes
+```{r}
+n1_markers_subclust <- FindAllMarkers(n1, 
+                          min.pct = -Inf, 
+                          logfc.threshold = .5, 
+                          only.pos = T, 
+                          test.use = "MAST",
+                          latent.vars = c('percent.mt', 'nFeature_RNA'))
+
+n1_markers_subclust
+```
+
+#Neuron 2
+```{r}
+neuron2 <- subset(oculina_named_h, idents = "Neuron 2") 
+
+n2 <- FindVariableFeatures(neuron2, selection.method = "vst")
+n2 <- ScaleData(n2, verbose = FALSE, assay="RNA")
+n2 <- RunPCA(n2)
+n2 <- RunUMAP(n2, reduction="pca", dims=1:30, return.model=TRUE)
+n2 <- FindNeighbors(n2, reduction ="pca", dims=1:30)
+
+n2 <- FindClusters(n2, resolution = 0.25)
+#2
+
+n2@meta.data$seurat_clusters <- as.numeric(as.character(n2@meta.data$seurat_clusters))+1
+Idents(n2)<- "seurat_clusters"
+n2$seurat_clusters
+n2@active.ident <- factor(x = n2@active.ident, levels = 1:2)
+n2@active.ident
+
+plot27 <- DimPlot(n2, reduction = "umap", label = T)
+plot28 <- DimPlot(n2, reduction = "umap", label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + ggtitle("") + theme(legend.text=element_text(size=10))
+#umap_neuron2_plot27plot28 10x4
+```
+
+```{r}
+n2_topfeat <- TopFeatures(object = n2[["pca"]], dim = 1, nfeatures = 20, balanced = TRUE)
+n2[["umap"]]@cell.embeddings
+columns <- c(paste0("PC_", 1:10),
+            "ident",
+            "UMAP_1", "UMAP_2")
+pc_data_n2 <- FetchData(n2, 
+                     vars = columns)
+# Adding cluster label to center of cluster on UMAP
+umap_label_n2 <- FetchData(n2, 
+  vars = c("ident", "UMAP_1", "UMAP_2"))  %>%
+  group_by(ident) %>%
+  summarise(x=mean(UMAP_1), y=mean(UMAP_2))
+# Plotting a UMAP plot for each of the PCs
+
+map(paste0("PC_", 1:10), function(pc){
+        ggplot(pc_data_n2, 
+               aes(UMAP_1, UMAP_2)) +
+                geom_point(aes_string(color=pc), 
+                           alpha = 0.7) +
+                scale_color_gradient(guide = FALSE, 
+                                     low = "grey90", 
+                                     high = "blue")  +
+                geom_text(data=umap_label_n2, 
+                          aes(label=ident, x, y)) +
+                ggtitle(pc)
+}) %>% 
+        plot_grid(plotlist = .)
+#saved as n2_pcplots_umap_020224
+
+DimPlot(n2, reduction = "pca", label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5))
+
+stdev_n2 <- Stdev(n2, reduction = "pca")
+
+pca_n2 <- pc_data_n2
+pca_n2$sym_state <- n2@meta.data$condition
+summary(aov(PC_1 ~ sym_state, data = pca_n2)) #0.515
+summary(aov(PC_2 ~ sym_state, data = pca_n2)) #0.26
+summary(aov(PC_3 ~ sym_state, data = pca_n2)) #0.601
+summary(aov(PC_4 ~ sym_state, data = pca_n2)) #0.149
+summary(aov(PC_5 ~ sym_state, data = pca_n2)) #0.242                         
+summary(aov(PC_6 ~ sym_state, data = pca_n2)) #0.00536 **
+summary(aov(PC_7 ~ sym_state, data = pca_n2)) #0.67
+summary(aov(PC_8 ~ sym_state, data = pca_n2)) #0.161
+summary(aov(PC_9 ~ sym_state, data = pca_n2)) #0.2
+summary(aov(PC_10 ~ sym_state, data = pca_n2)) #0.171
+
+#Check 6 with 1 i guess
+
+adonis2(pca_n2[,c(1,6)] ~ sym_state, data = pca_n2[c(1,6,14)], method='eu', na.rm = TRUE)
+#           Df SumOfSqs      R2     F Pr(>F)   
+# sym_state   1    318.4 0.01696 2.5874  0.032 *
+#Residual  150  18456.7 0.98304                
+#Total     151  18775.1 1.00000 
+
+li_n2 <- stdev_n2^2 / sum(stdev_n2^2)
+pc1v_n2 <- round(li_n2[1] * 100, 1) #7.8 of variance
+pc6v_n2 <- round(li_n2[6] * 100, 1) #3.3 of variance
+
+n2_pc1.6 <- DimPlot(n2, reduction = "pca", dims = c(1, 6), label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + xlab(paste0("PC1: ",pc1v_n2,"% variance")) + ylab(paste0("PC6: ", pc6v_n2, "% variance"))
+#saved as n2_pc1_pc6_020224 with 5x4.5 dims
+
+print(n2[["pca"]], dims = 1:10, nfeatures = 10)
+#PC_ 6
+#Positive: HMCN1.21, EVM.20prediction.20chromosome.13.206, GP2.5, NLRC4.14, EVM.20prediction.20chromosome.7.347, TBB4, HMCN1.59, CRDL2, CADN.10, STRP2 
+#Negative:  EVM.20prediction.20chromosome.14.914, SEPT7, EVM.20prediction.20chromosome.13.2022, LOXH1.5, PCDL, ACH10.3, C163A.4, GBRB3.10, FOXL2, TBA1D 
+
+
+DefaultAssay(n2) <- "RNA"
+n2[["RNA"]]@counts<-as.matrix(n2[["RNA"]]@counts)+1
+
+n2_mark <- FindMarkers(n2, ident.1 = "sym", ident.2="apo", group.by = "condition", test.use="DESeq2", slot = "counts")
+head(n2_mark)
+#pretty sure in this case neg lfc means down in sym; pos lfc means up in sym
+n2_mark <- rownames_to_column(n2_mark, var="gene_symbol")
+
+n2_pc6_feat <- c("HMCN1.21", "EVM.20prediction.20chromosome.13.206", "GP2.5", "NLRC4.14", "EVM.20prediction.20chromosome.7.347", "TBB4", "HMCN1.59", "CRDL2", "CADN.10", "STRP2", "EVM.20prediction.20chromosome.14.914", "SEPT7", "EVM.20prediction.20chromosome.13.2022", "LOXH1.5", "PCDL", "ACH10.3", "C163A.4", "GBRB3.10", "FOXL2", "TBA1D")
+
+#visualize the pc6 features in barplot
+n2_pc6_mark <- subset(n2_mark, gene_symbol %in% n2_pc6_feat)
+# add a column of NAs
+n2_pc6_mark$diffexpressed <- "ns"
+# if log2Foldchange > 0 set as "SYM"
+n2_pc6_mark$diffexpressed[n2_pc6_mark$avg_log2FC > 0] <- "SYM"
+# if log2Foldchange < 0 set as "APO"
+n2_pc6_mark$diffexpressed[n2_pc6_mark$avg_log2FC < 0] <- "APO"
+
+n2_pc6_bar <- ggplot(data=n2_pc6_mark, aes(y=gene_symbol, x=avg_log2FC, fill=diffexpressed)) +
+  geom_bar(position="stack", stat="identity", color="black", alpha=0.6)+
+  scale_fill_manual(values=c("gray40", "#CC6600"))+
+  theme_classic()
+##saved as n2_pc6_barplot as landscape 8x5
+```
+
+Look at subcluster marker genes
+```{r}
+n2_markers_subclust <- FindAllMarkers(n2, 
+                          min.pct = -Inf, 
+                          logfc.threshold = .5, 
+                          only.pos = T, 
+                          test.use = "MAST",
+                          latent.vars = c('percent.mt', 'nFeature_RNA'))
+
+n2_markers_subclust
+```
+
+#Neuron 3
+```{r}
+neuron3 <- subset(oculina_named_h, idents = "Neuron 3") 
+
+n3 <- FindVariableFeatures(neuron3, selection.method = "vst")
+n3 <- ScaleData(n3, verbose = FALSE, assay="RNA")
+n3 <- RunPCA(n3)
+n3 <- RunUMAP(n3, reduction="pca", dims=1:30, return.model=TRUE)
+n3 <- FindNeighbors(n3, reduction ="pca", dims=1:30)
+
+n3 <- FindClusters(n3, resolution = 0.25)
+#2
+
+n3@meta.data$seurat_clusters <- as.numeric(as.character(n3@meta.data$seurat_clusters))+1
+Idents(n3)<- "seurat_clusters"
+n3$seurat_clusters
+n3@active.ident <- factor(x = n3@active.ident, levels = 1:2)
+n3@active.ident
+
+plot29 <- DimPlot(n3, reduction = "umap", label = T)
+plot30 <- DimPlot(n3, reduction = "umap", label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + ggtitle("") + theme(legend.text=element_text(size=10))
+#umap_neuron3_plot29plot30 10x4
+```
+
+```{r}
+n3_topfeat <- TopFeatures(object = n3[["pca"]], dim = 1, nfeatures = 20, balanced = TRUE)
+n3[["umap"]]@cell.embeddings
+columns <- c(paste0("PC_", 1:10),
+            "ident",
+            "UMAP_1", "UMAP_2")
+pc_data_n3 <- FetchData(n3, 
+                     vars = columns)
+# Adding cluster label to center of cluster on UMAP
+umap_label_n3 <- FetchData(n3, 
+  vars = c("ident", "UMAP_1", "UMAP_2"))  %>%
+  group_by(ident) %>%
+  summarise(x=mean(UMAP_1), y=mean(UMAP_2))
+# Plotting a UMAP plot for each of the PCs
+
+map(paste0("PC_", 1:10), function(pc){
+        ggplot(pc_data_n3, 
+               aes(UMAP_1, UMAP_2)) +
+                geom_point(aes_string(color=pc), 
+                           alpha = 0.7) +
+                scale_color_gradient(guide = FALSE, 
+                                     low = "grey90", 
+                                     high = "blue")  +
+                geom_text(data=umap_label_n3, 
+                          aes(label=ident, x, y)) +
+                ggtitle(pc)
+}) %>% 
+        plot_grid(plotlist = .)
+#saved as n3_pcplots_umap_020224
+
+DimPlot(n3, reduction = "pca", label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5))
+
+stdev_n3 <- Stdev(n3, reduction = "pca")
+
+pca_n3 <- pc_data_n3
+pca_n3$sym_state <- n3@meta.data$condition
+summary(aov(PC_1 ~ sym_state, data = pca_n3)) #0.485
+summary(aov(PC_2 ~ sym_state, data = pca_n3)) #0.275
+summary(aov(PC_3 ~ sym_state, data = pca_n3)) #0.259
+summary(aov(PC_4 ~ sym_state, data = pca_n3)) #0.857
+summary(aov(PC_5 ~ sym_state, data = pca_n3)) #0.0588 .                         
+summary(aov(PC_6 ~ sym_state, data = pca_n3)) #0.0155 *
+summary(aov(PC_7 ~ sym_state, data = pca_n3)) #0.74
+summary(aov(PC_8 ~ sym_state, data = pca_n3)) #0.801
+summary(aov(PC_9 ~ sym_state, data = pca_n3)) #0.167
+summary(aov(PC_10 ~ sym_state, data = pca_n3)) #0.255
+
+#Check 6 with 1 again? 5 is kinda sig
+
+adonis2(pca_n3[,c(1,6)] ~ sym_state, data = pca_n3[c(1,6,14)], method='eu', na.rm = TRUE)
+# 0.159
+# no sig interaction
+adonis2(pca_n3[,c(5,6)] ~ sym_state, data = pca_n3[c(5,6,14)], method='eu', na.rm = TRUE)
+#          Df SumOfSqs      R2     F Pr(>F)    
+#sym_state  1    493.7 0.05955 4.876  0.001 ***
+#Residual  77   7795.9 0.94045                 
+#Total     78   8289.5 1.00000          
+
+li_n3 <- stdev_n3^2 / sum(stdev_n3^2)
+pc5v_n3 <- round(li_n3[5] * 100, 1) #3.2 of variance
+pc6v_n3 <- round(li_n3[6] * 100, 1) #3.1 of variance
+
+n3_pc5.6 <- DimPlot(n3, reduction = "pca", dims = c(5, 6), label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + xlab(paste0("PC5: ",pc5v_n3,"% variance")) + ylab(paste0("PC6: ", pc6v_n3, "% variance"))
+#saved as n3_pc5_pc6_020224 with 5x4.5 dims
+
+print(n3[["pca"]], dims = 1:10, nfeatures = 10)
+#PC_ 5 
+#Positive:  VWDE.4, S6A19.1, DJC16, LICH.1, HLF.3, GCC1, EVM.20prediction.20chromosome.14.6833, PTPRD.9, X5HT2B.3, CG057 
+#Negative:  KNOP1, HMCN1.59, ANXA6, AHNK, DAAM1.1, CORO7, YIF1B, EVM.20prediction.20chromosome.10.254, EMC2, BECN1 
+#PC_ 6 
+#Positive:  CUL4B.1, EVM.20prediction.20chromosome.7.1680, ACOC.1, HMCN1.59, ANXA6, AHNK, MBOA2.1, KNOP1, BECN1, EMC2 
+#Negative:  GLHR, CORO6, EVM.20prediction.20chromosome.14.829, PTN1, PFD3, FARP2, ZC12C.1, FBN2.22, SMC2, BMI1A
+
+DefaultAssay(n3) <- "RNA"
+n3[["RNA"]]@counts<-as.matrix(n3[["RNA"]]@counts)+1
+
+n3_mark <- FindMarkers(n3, ident.1 = "sym", ident.2="apo", group.by = "condition", test.use="DESeq2", slot = "counts")
+head(n3_mark)
+#pretty sure in this case neg lfc means down in sym; pos lfc means up in sym
+n3_mark <- rownames_to_column(n3_mark, var="gene_symbol")
+
+n3_pc5_feat <- c("VWDE.4", "S6A19.1", "DJC16", "LICH.1", "HLF.3", "GCC1", "EVM.20prediction.20chromosome.14.6833", "PTPRD.9", "X5HT2B.3", "CG057", "KNOP1", "HMCN1.59", "ANXA6", "AHNK", "DAAM1.1", "CORO7", "YIF1B", "EVM.20prediction.20chromosome.10.254", "EMC2", "BECN1")
+
+n3_pc6_feat <- c("CUL4B.1", "EVM.20prediction.20chromosome.7.1680", "ACOC.1", "HMCN1.59", "ANXA6", "AHNK", "MBOA2.1", "KNOP1", "BECN1", "EMC2", "GLHR", "CORO6", "EVM.20prediction.20chromosome.14.829", "PTN1", "PFD3", "FARP2", "ZC12C.1", "FBN2.22", "SMC2", "BMI1A")
+
+#visualize the pc5 features in barplot
+n3_pc5_mark <- subset(n3_mark, gene_symbol %in% n3_pc5_feat)
+# add a column of NAs
+n3_pc5_mark$diffexpressed <- "ns"
+# if log2Foldchange > 0 set as "SYM"
+n3_pc5_mark$diffexpressed[n3_pc5_mark$avg_log2FC > 0] <- "SYM"
+# if log2Foldchange < 0 set as "APO"
+n3_pc5_mark$diffexpressed[n3_pc5_mark$avg_log2FC < 0] <- "APO"
+
+n3_pc5_bar <- ggplot(data=n3_pc5_mark, aes(y=gene_symbol, x=avg_log2FC, fill=diffexpressed)) +
+  geom_bar(position="stack", stat="identity", color="black", alpha=0.6)+
+  scale_fill_manual(values=c("gray40", "#CC6600"))+
+  theme_classic()
+##saved as n3_pc5_barplot as landscape 8x5
+#veryyy low lfc values
+
+#visualize the pc6 features in barplot
+n3_pc6_mark <- subset(n3_mark, gene_symbol %in% n3_pc6_feat)
+# add a column of NAs
+n3_pc6_mark$diffexpressed <- "ns"
+# if log2Foldchange > 0 set as "SYM"
+n3_pc6_mark$diffexpressed[n3_pc6_mark$avg_log2FC > 0] <- "SYM"
+# if log2Foldchange < 0 set as "APO"
+n3_pc6_mark$diffexpressed[n3_pc6_mark$avg_log2FC < 0] <- "APO"
+
+n3_pc6_bar <- ggplot(data=n3_pc6_mark, aes(y=gene_symbol, x=avg_log2FC, fill=diffexpressed)) +
+  geom_bar(position="stack", stat="identity", color="black", alpha=0.6)+
+  scale_fill_manual(values=c("gray40", "#CC6600"))+
+  theme_classic()
+##saved as n3_pc6_barplot as landscape 8x5
+```
+
+Look at subcluster marker genes
+```{r}
+n3_markers_subclust <- FindAllMarkers(n3, 
+                          min.pct = -Inf, 
+                          logfc.threshold = .5, 
+                          only.pos = T, 
+                          test.use = "MAST",
+                          latent.vars = c('percent.mt', 'nFeature_RNA'))
+
+n3_markers_subclust
+```
+
+#Epidermis 1
+```{r}
+epidermis1 <- subset(oculina_named_h, idents = "Epidermis 1") 
+
+e1 <- FindVariableFeatures(epidermis1, selection.method = "vst")
+e1 <- ScaleData(e1, verbose = FALSE, assay="RNA")
+e1 <- RunPCA(e1)
+e1 <- RunUMAP(e1, reduction="pca", dims=1:30, return.model=TRUE)
+e1 <- FindNeighbors(e1, reduction ="pca", dims=1:30)
+
+e1 <- FindClusters(e1, resolution = 0.25)
+#5
+
+e1@meta.data$seurat_clusters <- as.numeric(as.character(e1@meta.data$seurat_clusters))+1
+Idents(e1)<- "seurat_clusters"
+e1$seurat_clusters
+e1@active.ident <- factor(x = e1@active.ident, levels = 1:5)
+e1@active.ident
+
+plot31 <- DimPlot(e1, reduction = "umap", label = T)
+plot32 <- DimPlot(e1, reduction = "umap", label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + ggtitle("") + theme(legend.text=element_text(size=10))
+#umap_epi1_plot31plot32 10x4
+```
+
+```{r}
+e1_topfeat <- TopFeatures(object = e1[["pca"]], dim = 1, nfeatures = 20, balanced = TRUE)
+e1[["umap"]]@cell.embeddings
+columns <- c(paste0("PC_", 1:10),
+            "ident",
+            "UMAP_1", "UMAP_2")
+pc_data_e1 <- FetchData(e1, 
+                     vars = columns)
+# Adding cluster label to center of cluster on UMAP
+umap_label_e1 <- FetchData(e1, 
+  vars = c("ident", "UMAP_1", "UMAP_2"))  %>%
+  group_by(ident) %>%
+  summarise(x=mean(UMAP_1), y=mean(UMAP_2))
+# Plotting a UMAP plot for each of the PCs
+
+map(paste0("PC_", 1:10), function(pc){
+        ggplot(pc_data_e1, 
+               aes(UMAP_1, UMAP_2)) +
+                geom_point(aes_string(color=pc), 
+                           alpha = 0.7) +
+                scale_color_gradient(guide = FALSE, 
+                                     low = "grey90", 
+                                     high = "blue")  +
+                geom_text(data=umap_label_e1, 
+                          aes(label=ident, x, y)) +
+                ggtitle(pc)
+}) %>% 
+        plot_grid(plotlist = .)
+#saved as e1_pcplots_umap_020224
+
+DimPlot(e1, reduction = "pca", label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5))
+
+stdev_e1 <- Stdev(e1, reduction = "pca")
+
+pca_e1 <- pc_data_e1
+pca_e1$sym_state <- e1@meta.data$condition
+summary(aov(PC_1 ~ sym_state, data = pca_e1)) #0.511
+summary(aov(PC_2 ~ sym_state, data = pca_e1)) #1.37e-06 ***
+summary(aov(PC_3 ~ sym_state, data = pca_e1)) #0.277
+summary(aov(PC_4 ~ sym_state, data = pca_e1)) #0.859
+summary(aov(PC_5 ~ sym_state, data = pca_e1)) #0.0098 **                         
+summary(aov(PC_6 ~ sym_state, data = pca_e1)) #0.00427 **
+summary(aov(PC_7 ~ sym_state, data = pca_e1)) #0.000354 ***
+summary(aov(PC_8 ~ sym_state, data = pca_e1)) #0.0419 *
+summary(aov(PC_9 ~ sym_state, data = pca_e1)) #0.184
+summary(aov(PC_10 ~ sym_state, data = pca_e1)) #0.265
+
+#Check 2 with 5
+
+adonis2(pca_e1[,c(2,5)] ~ sym_state, data = pca_e1[c(2,5,14)], method='eu', na.rm = TRUE)
+#            Df SumOfSqs      R2      F Pr(>F)    
+#sym_state    1    475.1 0.01594 16.897  0.001 ***
+#Residual  1043  29328.6 0.98406                  
+#Total     1044  29803.8 1.00000         
+
+li_e1 <- stdev_e1^2 / sum(stdev_e1^2)
+pc2v_e1 <- round(li_e1[2] * 100, 1) #5.1 of variance
+pc5v_e1 <- round(li_e1[5] * 100, 1) #3.3 of variance
+
+e1_pc2.5 <- DimPlot(e1, reduction = "pca", dims = c(2, 5), label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + xlab(paste0("PC2: ",pc2v_e1,"% variance")) + ylab(paste0("PC5: ", pc5v_e1, "% variance"))
+#saved as e1_pc2_pc5_020224 with 5x4.5 dims
+
+print(e1[["pca"]], dims = 1:10, nfeatures = 10)
+#PC_ 2 
+#Positive:  EVM.20prediction.20chromosome.8.883, EVM.20prediction.20chromosome.12.3949, H5.1, EVM.20prediction.20chromosome.6.991, H2AV, NRP2.13, EVM.20prediction.20chromosome.13.429, INCEA, H10.2, PRC1 
+#Negative:  BAGS.1, DNAJ1, HSP16, TRAD1.1, TRAF3.9, EVM.20prediction.20chromosome.6.876, EVM.20prediction.20chromosome.11.2501, HSP71, EVM.20prediction.20chromosome.13.3824, HSF1 
+
+#PC_ 5 
+#Positive:  OIT3.15, EVM.20prediction.20chromosome.8.2198, PRAX, EVM.20prediction.20chromosome.13.2085, HMCN1.21, HMCN1.59, HAAF.2, EVM.20prediction.20chromosome.8.2202, EVM.20prediction.20chromosome.9.2773, CADN.16 
+#Negative:  OIT3.10, ZPP.30, OIT3.30, PXDN.10, PEG3.5, OIT3.29, EVM.20prediction.20chromosome.10.2674, EVM.20prediction.20chromosome.12.806, KCNA2, CEL3B
+
+DefaultAssay(e1) <- "RNA"
+e1[["RNA"]]@counts<-as.matrix(e1[["RNA"]]@counts)+1
+
+e1_mark <- FindMarkers(e1, ident.1 = "sym", ident.2="apo", group.by = "condition", test.use="DESeq2", slot = "counts")
+head(e1_mark)
+#pretty sure in this case neg lfc means down in sym; pos lfc means up in sym
+e1_mark <- rownames_to_column(e1_mark, var="gene_symbol")
+
+e1_pc2_feat <- c("EVM.20prediction.20chromosome.8.883", "EVM.20prediction.20chromosome.12.3949", "H5.1", "EVM.20prediction.20chromosome.6.991", "H2AV", "NRP2.13", "EVM.20prediction.20chromosome.13.429", "INCEA", "H10.2", "PRC1", "BAGS.1", "DNAJ1", "HSP16", "TRAD1.1", "TRAF3.9", "EVM.20prediction.20chromosome.6.876", "EVM.20prediction.20chromosome.11.2501", "HSP71", "EVM.20prediction.20chromosome.13.3824", "HSF1")
+
+e1_pc5_feat <- c("OIT3.15", "EVM.20prediction.20chromosome.8.2198", "PRAX", "EVM.20prediction.20chromosome.13.2085", "HMCN1.21", "HMCN1.59", "HAAF.2", "EVM.20prediction.20chromosome.8.2202", "EVM.20prediction.20chromosome.9.2773", "CADN.16", "OIT3.10", "ZPP.30", "OIT3.30", "PXDN.10", "PEG3.5", "OIT3.29", "EVM.20prediction.20chromosome.10.2674", "EVM.20prediction.20chromosome.12.806", "KCNA2", "CEL3B")
+
+#visualize the pc2 features in barplot
+e1_pc2_mark <- subset(e1_mark, gene_symbol %in% e1_pc2_feat)
+# add a column of NAs
+e1_pc2_mark$diffexpressed <- "ns"
+# if log2Foldchange > 0 set as "SYM"
+e1_pc2_mark$diffexpressed[e1_pc2_mark$avg_log2FC > 0] <- "SYM"
+# if log2Foldchange < 0 set as "APO"
+e1_pc2_mark$diffexpressed[e1_pc2_mark$avg_log2FC < 0] <- "APO"
+
+e1_pc2_bar <- ggplot(data=e1_pc2_mark, aes(y=gene_symbol, x=avg_log2FC, fill=diffexpressed)) +
+  geom_bar(position="stack", stat="identity", color="black", alpha=0.6)+
+  scale_fill_manual(values=c("gray40", "#CC6600"))+
+  theme_classic()
+##saved as e1_pc2_barplot as landscape 8x5
+
+
+#visualize the pc5 features in barplot
+e1_pc5_mark <- subset(e1_mark, gene_symbol %in% e1_pc5_feat)
+# add a column of NAs
+e1_pc5_mark$diffexpressed <- "ns"
+# if log2Foldchange > 0 set as "SYM"
+e1_pc5_mark$diffexpressed[e1_pc5_mark$avg_log2FC > 0] <- "SYM"
+# if log2Foldchange < 0 set as "APO"
+e1_pc5_mark$diffexpressed[e1_pc5_mark$avg_log2FC < 0] <- "APO"
+
+e1_pc5_bar <- ggplot(data=e1_pc5_mark, aes(y=gene_symbol, x=avg_log2FC, fill=diffexpressed)) +
+  geom_bar(position="stack", stat="identity", color="black", alpha=0.6)+
+  scale_fill_manual(values=c("gray40", "#CC6600"))+
+  theme_classic()
+##saved as e1_pc5_barplot as landscape 8x5
+```
+
+```{r}
+e1_markers_subclust <- FindAllMarkers(e1, 
+                          min.pct = -Inf, 
+                          logfc.threshold = .5, 
+                          only.pos = T, 
+                          test.use = "MAST",
+                          latent.vars = c('percent.mt', 'nFeature_RNA'))
+
+e1_markers_subclust
+```
+
+#Epidermis 2
+```{r}
+epidermis2 <- subset(oculina_named_h, idents = "Epidermis 2") 
+
+e2 <- FindVariableFeatures(epidermis2, selection.method = "vst")
+e2 <- ScaleData(e2, verbose = FALSE, assay="RNA")
+e2 <- RunPCA(e2)
+e2 <- RunUMAP(e2, reduction="pca", dims=1:30, return.model=TRUE)
+e2 <- FindNeighbors(e2, reduction ="pca", dims=1:30)
+
+e2 <- FindClusters(e2, resolution = 0.25)
+#2
+
+e2@meta.data$seurat_clusters <- as.numeric(as.character(e2@meta.data$seurat_clusters))+1
+Idents(e2)<- "seurat_clusters"
+e2$seurat_clusters
+e2@active.ident <- factor(x = e2@active.ident, levels = 1:2)
+e2@active.ident
+
+plot33 <- DimPlot(e2, reduction = "umap", label = T)
+plot34 <- DimPlot(e2, reduction = "umap", label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + ggtitle("") + theme(legend.text=element_text(size=10))
+#umap_epi2_plot32plot34 10x4
+```
+
+```{r}
+e2_topfeat <- TopFeatures(object = e2[["pca"]], dim = 1, nfeatures = 20, balanced = TRUE)
+e2[["umap"]]@cell.embeddings
+columns <- c(paste0("PC_", 1:10),
+            "ident",
+            "UMAP_1", "UMAP_2")
+pc_data_e2 <- FetchData(e2, 
+                     vars = columns)
+# Adding cluster label to center of cluster on UMAP
+umap_label_e2 <- FetchData(e2, 
+  vars = c("ident", "UMAP_1", "UMAP_2"))  %>%
+  group_by(ident) %>%
+  summarise(x=mean(UMAP_1), y=mean(UMAP_2))
+# Plotting a UMAP plot for each of the PCs
+
+map(paste0("PC_", 1:10), function(pc){
+        ggplot(pc_data_e2, 
+               aes(UMAP_1, UMAP_2)) +
+                geom_point(aes_string(color=pc), 
+                           alpha = 0.7) +
+                scale_color_gradient(guide = FALSE, 
+                                     low = "grey90", 
+                                     high = "blue")  +
+                geom_text(data=umap_label_e2, 
+                          aes(label=ident, x, y)) +
+                ggtitle(pc)
+}) %>% 
+        plot_grid(plotlist = .)
+#saved as e2_pcplots_umap_020224
+
+DimPlot(e2, reduction = "pca", label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5))
+
+stdev_e2 <- Stdev(e2, reduction = "pca")
+
+pca_e2 <- pc_data_e2
+pca_e2$sym_state <- e2@meta.data$condition
+summary(aov(PC_1 ~ sym_state, data = pca_e2)) #0.0104 *
+summary(aov(PC_2 ~ sym_state, data = pca_e2)) #0.0134 *
+summary(aov(PC_3 ~ sym_state, data = pca_e2)) #0.0561 .
+summary(aov(PC_4 ~ sym_state, data = pca_e2)) #0.759
+summary(aov(PC_5 ~ sym_state, data = pca_e2)) #0.775                         
+summary(aov(PC_6 ~ sym_state, data = pca_e2)) #0.00727 **
+summary(aov(PC_7 ~ sym_state, data = pca_e2)) #0.656
+summary(aov(PC_8 ~ sym_state, data = pca_e2)) #0.261
+summary(aov(PC_9 ~ sym_state, data = pca_e2)) #0.115
+summary(aov(PC_10 ~ sym_state, data = pca_e2)) #0.118
+
+#Check 1, 2, and 6
+
+adonis2(pca_e2[,c(1,2)] ~ sym_state, data = pca_e2[c(1,2,14)], method='eu', na.rm = TRUE)
+#            Df SumOfSqs      R2      F Pr(>F)    
+#    sym_state   1     1564 0.01951 6.4874  0.001 ***
+#Residual  326    78605 0.98049                  
+#Total     327    80169 1.00000    
+
+adonis2(pca_e2[,c(1,6)] ~ sym_state, data = pca_e2[c(1,6,14)], method='eu', na.rm = TRUE)
+#sym_state   1     1297 0.02027 6.7444  0.001 ***
+#Residual  326    62691 0.97973                  
+#Total     327    63988 1.00000  
+
+adonis2(pca_e2[,c(2,6)] ~ sym_state, data = pca_e2[c(2,6,14)], method='eu', na.rm = TRUE)
+#sym_state   1      727 0.01955 6.501  0.002 **
+#Residual  326    36452 0.98045                
+#Total     327    37179 1.00000  
+
+li_e2 <- stdev_e2^2 / sum(stdev_e2^2)
+pc1v_e2 <- round(li_e2[1] * 100, 1) #18.4% of variance
+pc2v_e2 <- round(li_e2[2] * 100, 1) #9.2 of variance
+pc6v_e2 <- round(li_e2[6] * 100, 1) #3.6 of variance
+
+
+e2_pc1.2 <- DimPlot(e2, reduction = "pca", dims = c(1, 2), label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + xlab(paste0("PC1: ",pc1v_e2,"% variance")) + ylab(paste0("PC2: ", pc2v_e2, "% variance"))
+#saved as e2_pc1_pc2_020224 with 5x4.5 dims
+
+e2_pc1.6 <- DimPlot(e2, reduction = "pca", dims = c(1, 6), label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + xlab(paste0("PC1: ",pc1v_e2,"% variance")) + ylab(paste0("PC6: ", pc6v_e2, "% variance"))
+#saved as e2_pc1_pc6_020224 with 5x4.5 dims
+
+e2_pc2.6 <- DimPlot(e2, reduction = "pca", dims = c(2, 6), label=F, order=c("sym", "apo"), group.by = "condition", cols=alpha(c("gray40", "#CC6600"), 0.5)) + xlab(paste0("PC2: ",pc2v_e2,"% variance")) + ylab(paste0("PC6: ", pc6v_e2, "% variance"))
+#saved as e2_pc2_pc6_020224 with 5x4.5 dims
+
+print(e2[["pca"]], dims = 1:10, nfeatures = 10)
+#PC_ 1 
+#Positive:  CATL.4, ACBP, SAHH, ERG, SH3G1, HKDC1, FAXC.29, RAB8A.3, TNR6A, DPP3 
+#Negative:  EVM.20prediction.20chromosome.13.3589, MUC1.4, NRG3, PXDN.10, AKA7G, MLRP1.11, EVM.20prediction.20chromosome.2.1926, EVM.20prediction.20chromosome.14.2414, SERIC.3, FUCO.3 
+
+#PC_ 2 
+#Positive:  DDR48.2, EVM.20prediction.20chromosome.10.1213, EVM.20prediction.20chromosome.14.455, KLKB1.6, NO12A, GPX5, EVM.20prediction.20chromosome.10.1203, EVM.20prediction.20chromosome.10.1246, SAAR1, LIMC1 
+#Negative:  CO3, APOB.1, FBCD1.19, NELL2.1, AGRIN.5, EVM.20prediction.20chromosome.12.2569, CRIM1.1, FUCO.4, MPIP1, MASP2 
+
+#PC_ 6 
+#Positive:  EVM.20prediction.20chromosome.11.793, EVM.20prediction.20chromosome.9.551, BP10.2, EVM.20prediction.20chromosome.10.1335, PPBN, CSMD2.6, LIMC1, CALM.20, EVM.20prediction.20chromosome.13.1188, LRRC9 
+#Negative:  SQSTM, MOXD1.8, EVM.20prediction.20chromosome.9.902, EVM.20prediction.20chromosome.5.1374, SFRP4, EVM.20prediction.20chromosome.9.876, EVM.20prediction.20chromosome.8.633, EVM.20prediction.20chromosome.2.431, EVM.20prediction.20chromosome.9.897, NRBF2 
+
+
+DefaultAssay(e2) <- "RNA"
+e2[["RNA"]]@counts<-as.matrix(e2[["RNA"]]@counts)+1
+
+e2_mark <- FindMarkers(e2, ident.1 = "sym", ident.2="apo", group.by = "condition", test.use="DESeq2", slot = "counts")
+head(e2_mark)
+#pretty sure in this case neg lfc means down in sym; pos lfc means up in sym
+e2_mark <- rownames_to_column(e2_mark, var="gene_symbol")
+
+e2_pc1_feat <- c("CATL.4", "ACBP", "SAHH", "ERG", "SH3G1", "HKDC1", "FAXC.29", "RAB8A.3", "TNR6A", "DPP3", "EVM.20prediction.20chromosome.13.3589", "MUC1.4", "NRG3", "PXDN.10", "AKA7G", "MLRP1.11", "EVM.20prediction.20chromosome.2.1926", "EVM.20prediction.20chromosome.14.2414", "SERIC.3", "FUCO.3")
+
+e2_pc2_feat <- c("DDR48.2", "EVM.20prediction.20chromosome.10.1213", "EVM.20prediction.20chromosome.14.455", "KLKB1.6", "NO12A", "GPX5", "EVM.20prediction.20chromosome.10.1203", "EVM.20prediction.20chromosome.10.1246", "SAAR1", "LIMC1", "CO3", "APOB.1", "FBCD1.19", "NELL2.1", "AGRIN.5", "EVM.20prediction.20chromosome.12.2569", "CRIM1.1", "FUCO.4", "MPIP1", "MASP2")
+
+e2_pc6_feat <- c("EVM.20prediction.20chromosome.11.793", "EVM.20prediction.20chromosome.9.551", "BP10.2", "EVM.20prediction.20chromosome.10.1335", "PPBN", "CSMD2.6", "LIMC1", "CALM.20", "EVM.20prediction.20chromosome.13.1188", "LRRC9", "SQSTM", "MOXD1.8", "EVM.20prediction.20chromosome.9.902", "EVM.20prediction.20chromosome.5.1374", "SFRP4", "EVM.20prediction.20chromosome.9.876", "EVM.20prediction.20chromosome.8.633", "EVM.20prediction.20chromosome.2.431", "EVM.20prediction.20chromosome.9.897", "NRBF2")
+
+#visualize the pc1 features in barplot
+e2_pc1_mark <- subset(e2_mark, gene_symbol %in% e2_pc1_feat)
+# add a column of NAs
+e2_pc1_mark$diffexpressed <- "ns"
+# if log2Foldchange > 0 set as "SYM"
+e2_pc1_mark$diffexpressed[e2_pc1_mark$avg_log2FC > 0] <- "SYM"
+# if log2Foldchange < 0 set as "APO"
+e2_pc1_mark$diffexpressed[e2_pc1_mark$avg_log2FC < 0] <- "APO"
+
+e2_pc1_bar <- ggplot(data=e2_pc1_mark, aes(y=gene_symbol, x=avg_log2FC, fill=diffexpressed)) +
+  geom_bar(position="stack", stat="identity", color="black", alpha=0.6)+
+  scale_fill_manual(values=c("gray40", "#CC6600"))+
+  theme_classic()
+##saved as e2_pc1_barplot as landscape 8x5
+
+#pc2 features in barplot
+e2_pc2_mark <- subset(e2_mark, gene_symbol %in% e2_pc2_feat)
+# add a column of NAs
+e2_pc2_mark$diffexpressed <- "ns"
+# if log2Foldchange > 0 set as "SYM"
+e2_pc2_mark$diffexpressed[e2_pc2_mark$avg_log2FC > 0] <- "SYM"
+# if log2Foldchange < 0 set as "APO"
+e2_pc2_mark$diffexpressed[e2_pc2_mark$avg_log2FC < 0] <- "APO"
+
+e2_pc2_bar <- ggplot(data=e2_pc2_mark, aes(y=gene_symbol, x=avg_log2FC, fill=diffexpressed)) +
+  geom_bar(position="stack", stat="identity", color="black", alpha=0.6)+
+  scale_fill_manual(values=c("gray40", "#CC6600"))+
+  theme_classic()
+##saved as e2_pc2_barplot as landscape 8x5
+
+#visualize the pc6 features in barplot
+e2_pc6_mark <- subset(e2_mark, gene_symbol %in% e2_pc6_feat)
+# add a column of NAs
+e2_pc6_mark$diffexpressed <- "ns"
+# if log2Foldchange > 0 set as "SYM"
+e2_pc6_mark$diffexpressed[e2_pc6_mark$avg_log2FC > 0] <- "SYM"
+# if log2Foldchange < 0 set as "APO"
+e2_pc6_mark$diffexpressed[e2_pc6_mark$avg_log2FC < 0] <- "APO"
+
+e2_pc6_bar <- ggplot(data=e2_pc6_mark, aes(y=gene_symbol, x=avg_log2FC, fill=diffexpressed)) +
+  geom_bar(position="stack", stat="identity", color="black", alpha=0.6)+
+  scale_fill_manual(values=c("gray40", "#CC6600"))+
+  theme_classic()
+##saved as e2_pc6_barplot as landscape 8x5
+```
+
+```{r}
+e2_markers_subclust <- FindAllMarkers(e2, 
+                          min.pct = -Inf, 
+                          logfc.threshold = .5, 
+                          only.pos = T, 
+                          test.use = "MAST",
+                          latent.vars = c('percent.mt', 'nFeature_RNA'))
+
+e2_markers_subclust
+```
+
+
+Maybe what I need to do with some of these subclusters is just look at the diff expression within the subcluster but not recluster or anything just take the new subcluster and look at the diff express
+
+###Exploring signals of immunity and nutrition in different cells
+
+Zoom back out to the big picture and get lfc between apo and sym across the whole seurat object
+```{r}
+oculina_aposym <- oculina_named_h
+DefaultAssay(oculina_aposym) <- "RNA"
+oculina_aposym[["RNA"]]@counts<-as.matrix(oculina_aposym[["RNA"]]@counts)+1
+
+oculina_aposym_mark <- FindMarkers(oculina_aposym, ident.1 = "sym", ident.2="apo", group.by = "condition", test.use="DESeq2", slot = "counts")
+head(oculina_aposym_mark)
+#neg lfc means down in sym; pos lfc means up in sym
+oculina_aposym_mark <- rownames_to_column(oculina_aposym_mark, var="gene_symbol")
+```
+
+Idk whether this is how I'm going to arrange it, but for now:
+
+LGMN
+```{r}
+# in entire dataset (using oculina_aposym_mark): avg_log2FC is 0.11859230 and p_val_adj is 5.669471e-08
+```
+
+DHE
+```{r}
+#DHE3: avg_log2FC is 0.02668471 and p_val_adj is 1
+
+#DHE3.1: avg_log2FC is -0.01423657 and p_val_adj is 1
+
+#DHE4: avg_log2FC is 0.155605688 and p_val_adj is 4.620562e-15
+
+#DHE4.1: avg_log2FC is -0.007639307 and p_val_adj is 1
+```
+
+Apolipophorins
+```{r}
+#In the whole dataset
+#APO: avg_log2FC is 0.1478585 and p_val_adj us 1.948003e-13
+
+#APOB.1: avg_log2FC is 0.3614920 and p_val_adj is 1.145716e-55
+
+#APLP: avg_log2FC is 0.8373184 and p_val_adj is 4.183166e-136
+
+VlnPlot(object =oculina_named_h, features = c("APLP"), pt.size= 0,combine = F,assay = "RNA", group.by = "condition", cols=c("gray40", "#CC6600"))
+
+VlnPlot(object =oculina_named_h, features = c("APOB.1"), pt.size= 0,combine = F,assay = "RNA", group.by = "condition", cols=c("gray40", "#CC6600"))
+
+#now just in gderm1
+aplp_feat_gderm1 <- FeaturePlot(gderm_1, features = c("APLP"), order=TRUE, max.cutoff = 100, split.by = "condition")
+#idk not like super strong signal
+apoB_feat_gderm1 <- FeaturePlot(gderm_1, features = c("APOB"), order=TRUE, split.by = "condition")
+apoB1_feat_gderm1 <- FeaturePlot(gderm_1, features = c("APOB.1"), order=TRUE, split.by = "condition")
+
+aplp_vln1_gderm1 <- VlnPlot(object =gderm_1, features = c("APLP"), pt.size= 0,combine = F,assay = "RNA", group.by = "condition", cols=c("gray40", "#CC6600"))
+
+aplp_vln2_gderm1 <- VlnPlot(object =gderm_1, features = c("APLP"), pt.size= 0,combine = F,assay = "RNA", split.by = "condition", cols=c("gray40", "#CC6600"))
+#aplp_vln2_gderm1 as 4x3
+
+aplp_vln3_gderm1 <- VlnPlot(object =gderm_1, features = c("APLP"), pt.size= 0,combine = F,assay = "RNA", cols=alpha(c("#FF9900", "#33CC99", "#3333FF"), 0.5)) 
+
+apob1_vln1_gderm1 <- VlnPlot(object =gderm_1, features = c("APOB.1"), pt.size= 0,combine = F,assay = "RNA", group.by = "condition", cols=c("gray40", "#CC6600"))
+
+apob1_vln2_gderm1 <- VlnPlot(object =gderm_1, features = c("APOB.1"), pt.size= 0,combine = F,assay = "RNA", split.by = "condition", cols=c("gray40", "#CC6600"))
+#apob1_vln2_gderm1 as 4x3 landscape
+
+apob1_vln3_gderm1 <- VlnPlot(object =gderm_1, features = c("APOB.1"), pt.size= 0,combine = F,assay = "RNA", cols=alpha(c("#FF9900", "#33CC99", "#3333FF"), 0.5))
+#apob1_vln3_gderm1 as 4x3 landscape
+
+#now just in gderm2
+aplp_feat_gderm2 <- FeaturePlot(gderm_2, features = c("APLP"), order=TRUE, max.cutoff = 100, split.by = "condition")
+apoB_feat_gderm2 <- FeaturePlot(gderm_2, features = c("APOB"), order=TRUE, split.by = "condition")
+apoB1_feat_gderm2 <- FeaturePlot(gderm_2, features = c("APOB.1"), order=TRUE, split.by = "condition")
+
+aplp_vln1_gderm2 <- VlnPlot(object =gderm_2, features = c("APLP"), pt.size= 0,combine = F,assay = "RNA", group.by = "condition", cols=c("gray40", "#CC6600"))
+
+aplp_vln2_gderm2 <- VlnPlot(object =gderm_2, features = c("APLP"), pt.size= 0,combine = F,assay = "RNA", split.by = "condition", cols=c("gray40", "#CC6600"))
+#aplp_vln2_gderm2 as 4x3
+
+aplp_vln3_gderm2 <- VlnPlot(object =gderm_2, features = c("APLP"), pt.size= 0,combine = F,assay = "RNA", cols=alpha(c("#FF9900", "#33CC99", "#3333FF"), 0.5)) 
+#aplp_vln3_gderm2 as 4x3
+
+apob1_vln1_gderm2 <- VlnPlot(object =gderm_2, features = c("APOB.1"), pt.size= 0,combine = F,assay = "RNA", group.by = "condition", cols=c("gray40", "#CC6600"))
+#apob1_vln1_gderm2
+
+apob1_vln2_gderm2 <- VlnPlot(object =gderm_2, features = c("APOB.1"), pt.size= 0,combine = F,assay = "RNA", split.by = "condition", cols=c("gray40", "#CC6600"))
+#apob1_vln2_gderm2
+
+apob1_vln3_gderm2 <- VlnPlot(object =gderm_2, features = c("APOB.1"), pt.size= 0,combine = F,assay = "RNA", cols=alpha(c("#FF9900", "#33CC99", "#3333FF"), 0.5))
+#apob1_vln3_gderm2
+```
+
+Granulin GRN.5
+```{r}
+grn5_feat_gderm1 <- FeaturePlot(gderm_1, features = c("GRN.5"), order=TRUE, split.by = "condition")
+
+grn5_vln1_gderm1 <- VlnPlot(object =gderm_1, features = c("GRN.5"), pt.size= 0,combine = F,assay = "RNA", group.by = "condition", cols=c("gray40", "#CC6600"))
+
+grn5_vln2_gderm1 <- VlnPlot(object =gderm_1, features = c("GRN.5"), pt.size= 0,combine = F,assay = "RNA", split.by = "condition", cols=c("gray40", "#CC6600"))
+
+grn5_vln3_gderm1 <- VlnPlot(object =gderm_1, features = c("GRN.5"), pt.size= 0,combine = F,assay = "RNA", cols=alpha(c("#FF9900", "#33CC99", "#3333FF"), 0.5))
+
+
+grn5_feat_gderm2 <- FeaturePlot(gderm_2, features = c("GRN.5"), order=TRUE, split.by = "condition")
+
+grn5_vln2_gderm2 <- VlnPlot(object =gderm_2, features = c("GRN.5"), pt.size= 0,combine = F,assay = "RNA", split.by = "condition", cols=c("gray40", "#CC6600"))
+grn5_vln3_gderm2 <- VlnPlot(object =gderm_2, features = c("GRN.5"), pt.size= 0,combine = F,assay = "RNA", cols=alpha(c("#FF9900", "#33CC99", "#3333FF"), 0.5))
+```
+
+GLSN in gderm1 and gderm2
+```{r}
+glsn_feat_plot <- FeaturePlot(oculina_named_h, features = c("GLSN"), order=TRUE)
+
+glsn_vln_plot <- VlnPlot(oculina_named_h, features = c("GLSN"), pt.size= 0,combine = F,assay = "RNA", group.by = "condition", cols=c("gray40", "#CC6600")) #0.2450008 lfc and 4.242595e-42padj
+
+#in gderm1
+glsn_feat_gderm1 <- FeaturePlot(gderm_1, features = c("GLSN"), order=TRUE, split.by = "condition")
+
+glsn_vln1_gderm1 <- VlnPlot(object =gderm_1, features = c("GLSN"), pt.size= 0,combine = F,assay = "RNA", group.by = "condition", cols=c("gray40", "#CC6600")) #0.444327 lfc and 2.061649e-19 padj
+
+glsn_vln2_gderm1 <- VlnPlot(object =gderm_1, features = c("GLSN"), pt.size= 0,combine = F,assay = "RNA", split.by = "condition", cols=c("gray40", "#CC6600"))
+#glsn_vln2_gderm1 as 4x3
+
+glsn_vln3_gderm1 <- VlnPlot(object =gderm_1, features = c("GLSN"), pt.size= 0,combine = F,assay = "RNA", cols=alpha(c("#FF9900", "#33CC99", "#3333FF"), 0.5)) 
+#marker for 3; 1.101987 is lfc and 5.205839e-18 is padj
+#glsn_vln3_gderm1
+
+#in gderm2
+glsn_feat_gderm2 <- FeaturePlot(gderm_2, features = c("GLSN"), order=TRUE, split.by = "condition")
+
+glsn_vln1_gderm2 <- VlnPlot(object =gderm_2, features = c("GLSN"), pt.size= 0,combine = F,assay = "RNA", group.by = "condition", cols=c("gray40", "#CC6600")) #0.3004611 lfc and 2.891968e-08 padj
+
+glsn_vln2_gderm2 <- VlnPlot(object =gderm_2, features = c("GLSN"), pt.size= 0,combine = F,assay = "RNA", split.by = "condition", cols=c("gray40", "#CC6600"))
+#glsn_vln2_gderm2 as 4x3
+
+glsn_vln3_gderm2 <- VlnPlot(object =gderm_2, features = c("GLSN"), pt.size= 0,combine = F,assay = "RNA", cols=alpha(c("#FF9900", "#33CC99", "#3333FF"), 0.5)) 
+#marker for 3; 0.7606097 is lfc and 4.807843e-11 is padj
+#glsn_vln3_gderm2
+```
+
+Coexpression of APOB.1 and GLSN
+```{r}
+col=c("lightgrey", "#ff0000", "#3333ff")
+
+#in gderm1
+apob1_aplp_gderm1 <- FeaturePlot(object = gderm_1, features = c("APOB.1", "APLP"), blend = TRUE, keep.scale = "feature", blend.threshold = 0.1, cols=c("lightgrey", "#ff0000", "#3333ff"), order=TRUE)
+#apob1_aplp_gderm1 as 12x4
+
+glsn_dhe4_gderm1 <- FeaturePlot(object = gderm_1, features = c("GLSN", "DHE4"), blend = TRUE, blend.threshold = 0.1,  cols=c("lightgrey", "#ff0000", "#3333ff"), order=TRUE, keep.scale = "feature")
+
+dhe4_apob1_gderm1 <- FeaturePlot(object = gderm_1, features = c("DHE4", "APOB.1"), blend = TRUE, keep.scale = "feature", blend.threshold = 0.1,  cols=c("lightgrey", "#ff0000", "#3333ff"), order=TRUE)
+#dhe4_apob1_gderm1 as 12x4
+
+dhe4_aplp_gderm1 <- FeaturePlot(object = gderm_1, features = c("DHE4", "APLP"), blend = TRUE, keep.scale = "feature", blend.threshold = 0.1,  cols=c("lightgrey", "#ff0000", "#3333ff"), order=TRUE)
+#dhe4_aplp_gderm1
+
+#in gderm2
+apob1_aplp_gderm2 <- FeaturePlot(object = gderm_2, features = c("APOB.1", "APLP"), blend = TRUE, keep.scale = "feature", blend.threshold = 0.1, cols=c("lightgrey", "#ff0000", "#3333ff"), order=TRUE)
+#apob1_aplp_gderm2
+
+glsn_dhe4_gderm2 <- FeaturePlot(object = gderm_2, features = c("GLSN", "DHE4"), blend = TRUE, keep.scale = "feature", blend.threshold = 0.1,  cols=c("lightgrey", "#ff0000", "#3333ff"), order=TRUE)
+
+dhe4_aplp_gderm2 <- FeaturePlot(object = gderm_2, features = c("DHE4", "APLP"), blend = TRUE, keep.scale = "feature", blend.threshold = 0.1,  cols=c("lightgrey", "#ff0000", "#3333ff"), order=TRUE)
+#dhe4_aplp_gderm2 as 12x4
+
+glsn_aplp_gderm2 <- FeaturePlot(object = gderm_2, features = c("GLSN", "APLP"), blend = TRUE, keep.scale = "feature", blend.threshold = 0.1,  cols=c("lightgrey", "#ff0000", "#3333ff"), order=TRUE)
+#glsn_aplp_gderm2 as 12x4
+```
+
+
+DHE4
+```{r}
+dhe4_feat_plot <- FeaturePlot(oculina_named_h, features = c("DHE4"), order=TRUE)
+
+dhe4_vln_plot <- VlnPlot(oculina_named_h, features = c("DHE4"), pt.size= 0,combine = F,assay = "RNA", group.by = "condition", cols=c("gray40", "#CC6600")) # lfc = 1.712651e-19 and padj = 4.620562e-15
+
+#gderm_1
+dhe4_gderm1 <- FeaturePlot(object = gderm_1, features = c("DHE4"), order=TRUE)
+
+dhe4_vln2_gderm1 <- VlnPlot(object =gderm_1, features = c("DHE4"), pt.size= 0,combine = F,assay = "RNA", split.by = "condition", cols=c("gray40", "#CC6600"))
+#dhe4_vln2_gderm1 as 4x3 landscape
+
+dhe4_vln3_gderm1 <- VlnPlot(object =gderm_1, features = c("DHE4"), pt.size= 0,combine = F,assay = "RNA", cols=alpha(c("#FF9900", "#33CC99", "#3333FF"), 0.5))
+#dhe4_vln3_gderm1 as 4x3 landscape
+
+#gderm_2
+dhe4_gderm2 <- FeaturePlot(object = gderm_2, features = c("DHE4"), order=TRUE, split.by = "condition")
+
+dhe4_vln2_gderm2 <- VlnPlot(object =gderm_2, features = c("DHE4"), pt.size= 0,combine = F,assay = "RNA", split.by = "condition", cols=c("gray40", "#CC6600"))
+#dhe4_vln2_gderm2 as 4x3 landscape
+
+dhe4_vln3_gderm2 <- VlnPlot(object =gderm_2, features = c("DHE4"), pt.size= 0,combine = F,assay = "RNA", cols=alpha(c("#FF9900", "#33CC99", "#3333FF"), 0.5))
+#dhe4_vln3_gderm1 as 4x3 landscape
+```
+
+
+bubbleplot with gderm nutrition-linked genes
+```{r}
+nut_cycling <- c("DHE3", "DHE3.1", "DHE4", "DHE4.1", "GLSN", "GLNA", "GLNA.1", "APLP", "APOB", "APOB.1", "GRN.5", "GTR8.3")
+
+DotPlot(oculina_named_h, features = nut_cycling) + RotatedAxis()
+```
+
+
+Highlight cathepsins and NF-kB genes in gderm1
+```{r}
+#cathepsins
+
+#this is how you add scale bar to both https://github.com/satijalab/seurat/issues/1260
+catl.9_feat_plot_g1 <- FeaturePlot(gderm_1, features=c("CATL.9"), split.by = "condition", order = TRUE) + theme(legend.position = c(0.98,0.98))
+#catl.9_feat_plot_g1 as 8x4
+
+catz_feat_plot_g1 <- FeaturePlot(gderm_1, features=c("CATZ"), split.by = "condition", order = TRUE) + theme(legend.position = c(0.98,0.98))
+#less strong but same pattern
+#catz_feat_plot_g1 as 8x4 
+
+#catz_feat_plot_g1 <- patchwork::wrap_plots(FeaturePlot(gderm_1, features=c("CATZ"), split.by = "condition", combine=FALSE, order = TRUE)) + theme(legend.text=element_text(size=10)) + scale_color_gradient(low = "gray", high = "blue", limits = c(0,20))
+
+catl.6_feat_plot_g1 <- FeaturePlot(gderm_1, features=c("CATL.6"), split.by = "condition", order = TRUE) + theme(legend.position = c(0.98,0.98))
+#less strong but same pattern
+#catl.6_feat_plot_g1
+
+catl.8_feat_plot_g1 <- FeaturePlot(gderm_1, features=c("CATL.8"), split.by = "condition", order = TRUE) + theme(legend.position = c(0.98,0.98)) 
+#in both apo and sym; still mostly in cluster 1 but some cluster 3 in sym
+#catl.8_feat_plot_g1
+
+catb.1_feat_plot_g1 <- FeaturePlot(gderm_1, features=c("CATB.1"), split.by = "condition", order = TRUE) + theme(legend.position = c(0.98,0.98)) 
+#same as catl.8 kinda but stronger
+#catb.1_feat_plot_g1
+
+#alpha-crystallin A; significantly higher in apo than sym l2fc = -0.4569126 and padj = 4.515263e-21
+alphaA_feat_plot_g1 <- FeaturePlot(gderm_1, features=c("L2EFL.1"), split.by = "condition", order = TRUE) + theme(legend.position = c(0.98,0.98))  
+#in apo cells of cluster 1
+#alphaA_feat_plot_g1
+
+#H90
+h90a1_feat_plot_g1 <- FeaturePlot(gderm_1, features=c("H90A1"), split.by = "condition", order = TRUE) + theme(legend.position = c(0.98,0.98)) 
+#this is a good one
+#h90a1_feat_plot_g1
+
+#SODC
+sodc4_feat_plot_g1 <- FeaturePlot(gderm_1, features=c("SODC.4"), split.by = "condition", order = TRUE) + theme(legend.position = c(0.98,0.98)) 
+#marker for 1; in both apo and sym in 1
+#sodc4_feat_plot_g1
+
+#HSF1
+hsf1_feat_plot_g1 <- FeaturePlot(gderm_1, features=c("HSF1"), split.by = "condition", order = TRUE) + theme(legend.position = c(0.98,0.98)) 
+#marker for 1, not 
+#hsf1_feat_plot_g1
+```
+Paper on small HSPs and NF-kB in hydra: https://www.sciencedirect.com/science/article/pii/S104453231400061X#bib0155
+
+Check co-localization of 
+
